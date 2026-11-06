@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.model_loader.weight_utils import (
     checkpoint_layer_key,
     unquantized_layer_keys,
@@ -750,9 +751,17 @@ _CONFIG_REGISTRY: dict[str, str] = {
 # as a bare PretrainedConfig instead (see get_hf_config).
 _PLAIN_CONFIG_MODEL_TYPES: frozenset[str] = frozenset({"k3_dspark"})
 
+# a checkpoint architecture that is another's model under a new name: loaded
+# as that one (``get_hf_config``), so every table keyed by architecture holds
+# one entry for both
+ARCH_ALIASES: dict[str, str] = {
+    "KimiK31ForConditionalGeneration": "KimiK3ForConditionalGeneration",
+}
+
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
     "kimi_k3": "text_config",
+    "kimi_k31": "text_config",
     "kimi_k25": "text_config",
     "qwen3_5": "text_config",
     "qwen3_5_moe": "text_config",
@@ -793,6 +802,16 @@ def flatten_dsa_config(hf_config) -> None:
 
 
 def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConfig:
+    """``model``'s config, its architecture the one ATOM's tables key
+    (``ARCH_ALIASES``)."""
+    hf_config = _load_hf_config(model, trust_remote_code)
+    architectures = getattr(hf_config, "architectures", None)
+    if architectures and architectures[0] in ARCH_ALIASES:
+        hf_config.architectures = [ARCH_ALIASES[architectures[0]]]
+    return hf_config
+
+
+def _load_hf_config(model: str, trust_remote_code: bool) -> PretrainedConfig:
     config_dict, _ = PretrainedConfig.get_config_dict(
         model,
     )
@@ -1764,6 +1783,75 @@ class EPLBConfig:
         return cls(**cfg)
 
 
+_QSA_INDEX_SCORER_PROFILE_NAME = re.compile(r"[A-Za-z0-9_.\-]+")
+
+
+@dataclass
+class QSAIndexScorerConfig:
+    """Opt-in routing of the Qwen QSA index scorer to aiter's fused kernel.
+
+    OFF by default. With ``profile`` empty nothing is imported, the indexer
+    calls ATOM's own ``qsa_paged_mqa_logits`` through the stock
+    ``qsa_select_paged_tokens``, and the config hash is unchanged.
+
+    Fields:
+      - profile: aiter ``qsa_index_scorer`` profile name (e.g.
+        ``qsa_page4_gfx1250_v1``) or a path to a profile JSON. Passed as
+        ``profile=`` to every aiter call -- ATOM never relies on aiter's
+        ``AITER_QSA_INDEX_SCORER_PROFILE`` env var. Calls the profile does not
+        cover run ATOM's native scorer, with a logged reason.
+      - capture: path of a JSON file that receives every scorer call class
+        (shapes, dtypes, strides, buckets, cache layouts, rank, decision) for
+        the coverage matrix and aiter's ``gen_profile --plan-file``. May hold
+        ``{rank}`` / ``{pid}``; without them ``.rank<r>.pid<p>`` is appended.
+        Works with ``profile`` empty too (every call then runs native).
+    """
+
+    profile: str = ""
+    capture: str = ""
+
+    def __post_init__(self):
+        self.profile = "" if self.profile is None else str(self.profile).strip()
+        self.capture = "" if self.capture is None else str(self.capture).strip()
+        if self.profile and not (
+            self.profile.endswith(".json")
+            or _QSA_INDEX_SCORER_PROFILE_NAME.fullmatch(self.profile)
+        ):
+            raise ValueError(
+                "qsa_index_scorer.profile must be a profile name "
+                f"([A-Za-z0-9_.-]+) or a path ending in .json, got {self.profile!r}"
+            )
+
+    @property
+    def enabled(self) -> bool:
+        """The fused scorer may run (a profile is named)."""
+        return bool(self.profile)
+
+    @property
+    def active(self) -> bool:
+        """A call-site route is installed (fused scorer and/or capture)."""
+        return bool(self.profile or self.capture)
+
+    def hash_factors(self) -> list:
+        """Contribution to ``Config.compute_hash``: empty while OFF, so turning
+        the feature off leaves every existing cache key unchanged. Capture only
+        observes, so it never keys anything."""
+        return [("qsa_index_scorer", self.profile)] if self.enabled else []
+
+    @classmethod
+    def from_dict(cls, cfg: dict | None) -> "QSAIndexScorerConfig":
+        """Build from the CLI values; unknown keys raise so typos fail fast."""
+        cfg = cfg or {}
+        allowed = {f.name for f in fields(cls)}
+        unknown = set(cfg) - allowed
+        if unknown:
+            raise ValueError(
+                f"Unknown qsa_index_scorer key(s): {sorted(unknown)}. "
+                f"Supported keys: {sorted(allowed)}"
+            )
+        return cls(**cfg)
+
+
 DCP_COMM_BACKENDS = ("ag_rs", "a2a")
 
 
@@ -2038,6 +2126,10 @@ class Config:
     # --no-encoder-swa-bounded-replay keeps checkpoints. No effect on other models.
     enable_encoder_swa_bounded_replay: bool = True
     scheduler_delay_factor: float = 0.0
+    # Prefill admission (`--prefill-admit-policy`): "interval" keeps
+    # ATOM_PREFILL_DECODE_INTERVAL and the coalescer; "adaptive" replaces both
+    # with the rent-or-buy rule in prefill_delayer.py.
+    prefill_admit_policy: str = "interval"
     max_num_seqs: int = 512
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.9
@@ -2136,6 +2228,9 @@ class Config:
     # EngineArgs) and pickled into every worker. Read sites use `config.dspark.*`
     # (no os.environ lookups). Defaults to all-off.
     dspark: DSparkConfig = field(default_factory=DSparkConfig)
+    # Opt-in aiter fused QSA index scorer (--qsa-index-scorer-profile /
+    # --qsa-index-scorer-capture). Default OFF: nothing imported, stock path.
+    qsa_index_scorer: QSAIndexScorerConfig = field(default_factory=QSAIndexScorerConfig)
 
     enable_tbo: bool = False
     enable_tbo_decode: bool = False
@@ -2276,6 +2371,19 @@ class Config:
         )
         self.throughput_log_interval_steps = 0
 
+    @property
+    def end_token_ids(self) -> tuple[int, ...]:
+        """Every token ID that terminates generation on this deployment."""
+        return tuple(
+            sorted(
+                {
+                    i
+                    for i in (self.eos_token_id, *self.stop_token_ids)
+                    if i is not None and i >= 0
+                }
+            )
+        )
+
     def __post_init__(self):
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
@@ -2293,6 +2401,13 @@ class Config:
             )
             self.enable_tbo = False
             self.enable_tbo_decode = False
+
+        self.prefill_admit_policy = self.prefill_admit_policy.strip().lower()
+        if self.prefill_admit_policy not in PREFILL_ADMIT_POLICIES:
+            raise ValueError(
+                f"prefill_admit_policy must be one of {PREFILL_ADMIT_POLICIES}, "
+                f"got {self.prefill_admit_policy!r}"
+            )
 
         self.moe_backend = self.moe_backend.strip().lower()
         if self.moe_backend not in ("standard", "mega"):
@@ -2327,6 +2442,19 @@ class Config:
             self.dcp_config = DCPConfig(**self.dcp_config.__dict__)
         else:
             raise TypeError("dcp_config must be DCPConfig or dict")
+        if self.qsa_index_scorer is None:
+            self.qsa_index_scorer = QSAIndexScorerConfig()
+        elif isinstance(self.qsa_index_scorer, dict):
+            self.qsa_index_scorer = QSAIndexScorerConfig.from_dict(
+                self.qsa_index_scorer
+            )
+        elif isinstance(self.qsa_index_scorer, QSAIndexScorerConfig):
+            # Normalize/validate even when constructed programmatically.
+            self.qsa_index_scorer = QSAIndexScorerConfig(
+                **self.qsa_index_scorer.__dict__
+            )
+        else:
+            raise TypeError("qsa_index_scorer must be QSAIndexScorerConfig or dict")
         # assert os.path.isdir(self.model)
 
         # The forced-acceptance schedule spends its whole budget on the first
@@ -2927,6 +3055,11 @@ class Config:
         # faults on the first decode past the old width.
         factors.append(self.max_model_len)
         factors.append(self.max_num_seqs)
+        # The fused QSA index scorer swaps the scorer kernel. Keyed only while
+        # ON, so every hash computed with the feature off is unchanged.
+        qsa_index_scorer = getattr(self, "qsa_index_scorer", None)
+        if qsa_index_scorer is not None:
+            factors.extend(qsa_index_scorer.hash_factors())
         # The drafter graph bakes its draft width in as a constant (DSpark traces
         # `[bs, num_draft]`), so a run that only changes --num-speculative-tokens
         # would otherwise load the other width's artifact: draft 6 over a draft 3
