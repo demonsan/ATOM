@@ -28,10 +28,14 @@ PROVIDER_NAME = "qkv-proj-fusion-provider"
 OP_NAME = "qkv_proj_fusion"
 
 _DECISIONS: dict[str, int] = {}
+_LOGGED: set[str] = set()
 
 
 def _note(reason: str) -> None:
     _DECISIONS[reason] = _DECISIONS.get(reason, 0) + 1
+    if reason not in _LOGGED:
+        _LOGGED.add(reason)
+        logger.info("QKV projection fusion: native path, first reason %s", reason)
 
 
 def decisions() -> dict[str, int]:
@@ -139,6 +143,13 @@ class QkvProjFusionSite:
         from atom.utils.forward_context import get_forward_context
 
         forward_context = get_forward_context()
+        if "prologue-called" not in _LOGGED:
+            _LOGGED.add("prologue-called")
+            logger.info(
+                "QKV projection fusion: prologue called (tokens=%d prefill=%s)",
+                int(hidden_states.shape[0]),
+                bool(forward_context.context.is_prefill),
+            )
         why = self._decline(hidden_states, positions, qsa, forward_context)
         if why is not None:
             _note(why)
@@ -153,6 +164,10 @@ class QkvProjFusionSite:
         try:
             from aiter.ops.qkv_proj_fusion import qkv_proj_fusion as _op
 
+            # The contract takes the half-width tables the kernel indexes by position:
+            # ATOM keeps them as [max_pos, 1, 1, rotary_dim // 2] (bf16, contiguous).
+            cos_table = rope.cos_cache.reshape(rope.cos_cache.shape[0], -1)
+            sin_table = rope.sin_cache.reshape(rope.sin_cache.shape[0], -1)
             gate, query, index_q = _op(
                 hidden_states,
                 a.qkv_proj.weight,
@@ -160,8 +175,8 @@ class QkvProjFusionSite:
                 a.q_norm.weight,
                 a.k_norm.weight,
                 a.indexer.q_layernorm.weight,
-                rope.cos_cache,
-                rope.sin_cache,
+                cos_table,
+                sin_table,
                 positions,
                 qsa.slot_mapping,
                 a.k_cache,
