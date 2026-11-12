@@ -2099,6 +2099,9 @@ class Config:
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
+    # Opt-in out-of-tree aiter providers (``--aiter-provider-enable``); the only
+    # way to enable one. Default off: nothing provider-related is imported.
+    aiter_provider_enable: tuple[str, ...] = ()
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True

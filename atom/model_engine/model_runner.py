@@ -778,6 +778,15 @@ class ModelRunner:
 
         self.attn_backend = get_attn_backend(self.attn_family)
         self._setup_device_and_distributed(rank, config)
+        # Opt-in out-of-tree aiter providers: configure once per worker before the
+        # model is built, long before warm-up / CUDA-graph capture. Never raises.
+        try:
+            from atom.aiter_fused_ops import configure_aiter_fused_ops
+
+            self.aiter_fused_state = configure_aiter_fused_ops(config, "")
+        except Exception as exc:  # noqa: BLE001 - keep ATOM's own path
+            logger.warning("aiter fused ops: configure skipped (%r)", exc)
+            self.aiter_fused_state = None
 
         self.capture_sizes = [0]  # for eager fallback
         # The same ladder as an ASCENDING int32 array, which is what
