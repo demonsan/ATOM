@@ -53,17 +53,36 @@ def configure_aiter_fused_ops(config, rank_name: str = "") -> dict:
 
 
 def prewarm_aiter_fused_ops(config, models, rank_name: str = "") -> dict:
-    """Provider warm-up before capture; v1 has no tensor state, never raises."""
+    """Compile every class the CUDA-graph capture will replay. Never raises."""
 
     out: dict = {}
     if not _active(config):
         return out
     try:
-        from atom.aiter_provider import warmup_aiter_providers
-
-        out[OP_NAME] = warmup_aiter_providers(OP_NAME, None, rank_name=rank_name)
-    except Exception as exc:  # noqa: BLE001 - the first launch compiles instead
-        logger.warning(
-            "QKV projection fusion [%s]: prewarm skipped (%r)", rank_name or "-", exc
+        sizes = list(
+            getattr(getattr(config, "compilation_config", None), "cudagraph_capture_sizes", ())
+            or ()
         )
+        sites = []
+        for model in models:
+            for module in model.modules():
+                site = getattr(module, "qkv_proj_fusion", None)
+                if site is not None:
+                    sites.append(site)
+        warmed = 0
+        for site in sites:
+            warmed += int(site.warmup(sizes))
+        out[OP_NAME] = {"sites": len(sites), "sizes_warmed": warmed}
+        logger.info(
+            "QKV projection fusion [%s]: pre-capture warmup %s",
+            rank_name or "-",
+            out[OP_NAME],
+        )
+    except Exception as exc:  # noqa: BLE001 - first capture class then stays native
+        logger.warning(
+            "QKV projection fusion [%s]: pre-capture warmup failed (%r)",
+            rank_name or "-",
+            exc,
+        )
+        out[OP_NAME] = None
     return out
