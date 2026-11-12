@@ -436,6 +436,17 @@ class Qwen4ExpAttention(nn.Module):
                     qsa_select_paged_groups_with_scorer, scorer=scorer
                 )
 
+        # Opt-in fused projection epilogue (`--aiter-provider-enable` naming a
+        # provider of aiter's routed op `qkv_proj_fusion`): one routed call replaces
+        # this layer's qkv_proj + qk_norm + qsa_apply_mrope + _store_kv and the
+        # indexer's project_qk. OFF, or a provider/aiter that cannot serve: None,
+        # `forward` keeps its own path and nothing of the op is imported.
+        self.qkv_proj_fusion = None
+        if getattr(atom_config, "aiter_provider_enable", ()):
+            from atom.model_ops.qwen4_exp.qkv_proj_fusion import site_for
+
+            self.qkv_proj_fusion = site_for(self, atom_config)
+
     def bind_caches(
         self,
         k_cache: torch.Tensor,
@@ -508,6 +519,7 @@ class Qwen4ExpAttention(nn.Module):
         positions: torch.Tensor,
         qsa,
         rows=None,
+        index_q: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Update both index caches, then return the per-token selection.
 
@@ -516,15 +528,22 @@ class Qwen4ExpAttention(nn.Module):
         selects only its own query rows and the selected groups are
         all-gathered before the (cheap) expansion. Every row's selection
         depends only on its own query, so the result is the same.
+
+        `index_q`: the fused projection epilogue already normalized, rotated and
+        returned it (and wrote the raw index K rows plus the rope-position cache), so
+        only the stock `project_qk` path is skipped here.
         """
-        index_q, raw_key = self.indexer.project_qk(hidden_states, positions)
-        qsa_store_rows(self.raw_key_cache, qsa.slot_mapping, raw_key)
-        if self.rope_position_cache is not None:
-            qsa_store_rows(
-                self.rope_position_cache,
-                qsa.slot_mapping,
-                canonical_rope_positions(positions[..., : hidden_states.shape[0]]),
-            )
+        if index_q is None:
+            index_q, raw_key = self.indexer.project_qk(hidden_states, positions)
+            qsa_store_rows(self.raw_key_cache, qsa.slot_mapping, raw_key)
+            if self.rope_position_cache is not None:
+                qsa_store_rows(
+                    self.rope_position_cache,
+                    qsa.slot_mapping,
+                    canonical_rope_positions(
+                        positions[..., : hidden_states.shape[0]]
+                    ),
+                )
 
         pooled, first_positions = qsa_compress_groups(
             self.raw_key_cache,
@@ -611,48 +630,77 @@ class Qwen4ExpAttention(nn.Module):
         indexer still reads the BF16 `hidden_states`. `rows`: the decoder's
         token sharding, see `_select_tokens`."""
         num_tokens = hidden_states.shape[0]
-        qkv = (
-            self.qkv_proj(hidden_states)
-            if quantized is None
-            else self.qkv_proj(quantized[0], x_scale=quantized[1])
-        )
-        gate, q, k, v = qkv.split(
-            [self.q_size, self.q_size, self.kv_size, self.kv_size], -1
-        )
-        # Normalization and cache writes accept packed token strides without copies.
-        q, k = self.qk_norm(q, k)
-        query, key = qsa_apply_mrope(
-            self.rotary_emb,
-            positions,
-            q.view(num_tokens, self.num_heads, self.head_dim),
-            k.view(num_tokens, self.num_kv_heads, self.head_dim),
-        )
-        value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
         forward_context = get_forward_context()
-        qsa = forward_context.attn_metadata.qsa_metadata
-        if qsa is None:
-            attn_out = self._profile_attention(
-                query, key, value, hidden_states, positions
+        qsa_meta = forward_context.attn_metadata.qsa_metadata
+        fused = None
+        qsa = None
+        if (
+            self.qkv_proj_fusion is not None
+            and qsa_meta is not None
+            and not forward_context.context.is_prefill
+        ):
+            qsa = qsa_meta.for_tokens(num_tokens)
+            fused = self.qkv_proj_fusion.prologue(hidden_states, positions, qsa)
+        if fused is not None:
+            # The routed call already wrote the K/V, raw-index-K and rope-position
+            # caches and the normalized, mRoPE-rotated query: no `_store_kv` here.
+            gate, query, index_q = fused
+            selected = self._select_tokens(
+                hidden_states, positions, qsa, rows, index_q=index_q
+            )
+            attn_out = self._attend(
+                query,
+                selected,
+                qsa.block_tables,
+                qsa.token_to_req,
+                (
+                    None
+                    if forward_context.context.is_prefill
+                    else qsa.block_tables.shape[0]
+                ),
             )
         else:
-            qsa = qsa.for_tokens(num_tokens)
-            self._store_kv(key, value, qsa.slot_mapping)
-            selected = self._select_tokens(hidden_states, positions, qsa, rows)
-            attn_out = None
-            if forward_context.context.is_prefill:
-                attn_out = self._flydsl_attention(query, key, value, selected, qsa)
-            if attn_out is None:
-                attn_out = self._attend(
-                    query,
-                    selected,
-                    qsa.block_tables,
-                    qsa.token_to_req,
-                    (
-                        None
-                        if forward_context.context.is_prefill
-                        else qsa.block_tables.shape[0]
-                    ),
+            qkv = (
+                self.qkv_proj(hidden_states)
+                if quantized is None
+                else self.qkv_proj(quantized[0], x_scale=quantized[1])
+            )
+            gate, q, k, v = qkv.split(
+                [self.q_size, self.q_size, self.kv_size, self.kv_size], -1
+            )
+            # Normalization and cache writes accept packed token strides without copies.
+            q, k = self.qk_norm(q, k)
+            query, key = qsa_apply_mrope(
+                self.rotary_emb,
+                positions,
+                q.view(num_tokens, self.num_heads, self.head_dim),
+                k.view(num_tokens, self.num_kv_heads, self.head_dim),
+            )
+            value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
+            if qsa is None:
+                attn_out = self._profile_attention(
+                    query, key, value, hidden_states, positions
                 )
+            else:
+                self._store_kv(key, value, qsa.slot_mapping)
+                selected = self._select_tokens(hidden_states, positions, qsa, rows)
+                attn_out = None
+                if forward_context.context.is_prefill:
+                    attn_out = self._flydsl_attention(
+                        query, key, value, selected, qsa
+                    )
+                if attn_out is None:
+                    attn_out = self._attend(
+                        query,
+                        selected,
+                        qsa.block_tables,
+                        qsa.token_to_req,
+                        (
+                            None
+                            if forward_context.context.is_prefill
+                            else qsa.block_tables.shape[0]
+                        ),
+                    )
 
         if is_per_token_fp8_linear(self.o_proj):
             gated, gated_scale = sigmoid_mul_quant(

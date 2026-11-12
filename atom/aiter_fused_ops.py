@@ -33,6 +33,16 @@ def _qsa_index_scorer_active(config) -> bool:
     return observed or bool(getattr(config, "aiter_provider_enable", ()))
 
 
+def _qkv_proj_fusion_active(config) -> bool:
+    """``True`` only when the operator named this provider explicitly."""
+
+    from atom.model_ops.qwen4_exp.qkv_proj_fusion import PROVIDER_NAME, enabled
+
+    return enabled(config) and PROVIDER_NAME in tuple(
+        getattr(config, "aiter_provider_enable", ()) or ()
+    )
+
+
 def configure_aiter_fused_ops(config, rank_name: str = "") -> dict:
     """Configure every enabled opt-in op in this process.
 
@@ -56,6 +66,18 @@ def configure_aiter_fused_ops(config, rank_name: str = "") -> dict:
                 exc,
             )
             out["qsa_index_scorer"] = None
+    try:
+        if _qkv_proj_fusion_active(config):
+            from atom.model_ops.qwen4_exp.qkv_proj_fusion import configure
+
+            out["qkv_proj_fusion"] = configure(config, rank_name)
+    except Exception as exc:  # noqa: BLE001 -- fail-open: ATOM's own prologue
+        logger.warning(
+            "QKV projection fusion [%s]: configure failed (%r); native path",
+            rank_name or "-",
+            exc,
+        )
+        out["qkv_proj_fusion"] = None
     return out
 
 
@@ -66,7 +88,8 @@ def prewarm_aiter_fused_ops(config, models, rank_name: str = "") -> dict:
     (``qsa_index_scorer_caches()``). Never raises.
     """
     out: dict = {}
-    if not _qsa_index_scorer_active(config):
+    qkv_fusion_active = _qkv_proj_fusion_active(config)
+    if not _qsa_index_scorer_active(config) and not qkv_fusion_active:
         return out
     try:
         from atom.model_ops.qwen4_exp.qsa_index_scorer import prewarm
@@ -83,4 +106,15 @@ def prewarm_aiter_fused_ops(config, models, rank_name: str = "") -> dict:
         logger.warning(
             "QSA index scorer [%s]: prewarm skipped (%r)", rank_name or "-", exc
         )
+    if qkv_fusion_active:
+        try:
+            from atom.model_ops.qwen4_exp.qkv_proj_fusion import prewarm
+
+            out["qkv_proj_fusion"] = prewarm([], rank_name)
+        except Exception as exc:  # noqa: BLE001 -- first call compiles instead
+            logger.warning(
+                "QKV projection fusion [%s]: prewarm skipped (%r)",
+                rank_name or "-",
+                exc,
+            )
     return out
