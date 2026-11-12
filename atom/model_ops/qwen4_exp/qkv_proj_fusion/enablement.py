@@ -33,8 +33,12 @@ _LOGGED: set[str] = set()
 
 def _note(reason: str) -> None:
     _DECISIONS[reason] = _DECISIONS.get(reason, 0) + 1
-    if reason not in _LOGGED:
-        _LOGGED.add(reason)
+    if reason in _LOGGED:
+        return
+    _LOGGED.add(reason)
+    if reason == "served":
+        logger.info("QKV projection fusion: served")
+    else:
         logger.info("QKV projection fusion: native path, first reason %s", reason)
 
 
