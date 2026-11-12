@@ -4339,6 +4339,14 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        # Providers compile per call class; every class a captured graph will replay
+        # must have run eagerly first (capture may not compile or allocate).
+        try:
+            from atom.aiter_fused_ops import prewarm_aiter_fused_ops
+
+            prewarm_aiter_fused_ops(self.config, [self.model], "")
+        except Exception as exc:  # noqa: BLE001 - capture keeps the native path
+            logger.warning("aiter fused ops: pre-capture warmup skipped (%r)", exc)
         # M3 indexer-only CP puts an all-to-all in the captured decode path, and
         # NCCL sets up peer connections on a group's FIRST collective -- doing
         # that inside a capture hangs. warmup_model() does not cover it: its

@@ -30,6 +30,17 @@ OP_NAME = "qkv_proj_fusion"
 _DECISIONS: dict[str, int] = {}
 _LOGGED: set[str] = set()
 
+#: Batches the fused provider is golden-qualified on (the Stage1 rows). Any other batch
+#: keeps ATOM's own capture-safe prologue: declining is what routes a call to ATOM
+#: native, while an uncovered batch that reaches aiter falls back to its torch native
+#: path, which performs host work and cannot be CUDA-graph captured.
+_SERVED_TOKENS = frozenset(
+    {
+        1, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 448, 512, 576, 768,
+        1024, 1152, 1344, 1536, 1792,
+    }
+)
+
 
 def _note(reason: str) -> None:
     _DECISIONS[reason] = _DECISIONS.get(reason, 0) + 1
@@ -120,6 +131,8 @@ class QkvProjFusionSite:
             return "no-qsa-metadata"
         if hidden_states.dtype is not __import__("torch").bfloat16:
             return f"hidden-dtype-{hidden_states.dtype}"
+        if int(hidden_states.shape[0]) not in _SERVED_TOKENS:
+            return f"unqualified-batch-{int(hidden_states.shape[0])}"
         if getattr(a, "k_scale_cache", None) is not None:
             return "fp8-kv-native"
         if getattr(a, "k_cache", None) is None or a.k_cache.dtype is not hidden_states.dtype:
@@ -133,6 +146,97 @@ class QkvProjFusionSite:
         if getattr(rope, "rotary_dim", None) != getattr(irope, "rotary_dim", None):
             return "indexer-rope-dim-mismatch"
         return None
+
+    # -- graph pre-warm ------------------------------------------------------
+    def warmup(self, capture_sizes) -> int:
+        """Run one eager decode call per CUDA-graph capture size this site may serve.
+
+        Graph capture may only replay already-compiled work: the provider's per-class
+        prepare and the kernel's first-launch JIT must happen before it, so each size
+        the runner is about to capture is exercised here on scratch caches (the layer's
+        real caches are untouched). Returns the number of sizes exercised."""
+
+        a = self.attn
+        import torch
+
+        k_cache = getattr(a, "k_cache", None)
+        v_cache = getattr(a, "v_cache", None)
+        raw_k = getattr(a, "raw_key_cache", None)
+        if k_cache is None or v_cache is None or raw_k is None:
+            return 0
+        sizes = sorted({int(m) for m in capture_sizes if int(m) > 0})
+        if not sizes:
+            return 0
+        block = int(k_cache.shape[1])
+        pages = (max(sizes) + block - 1) // block + 1
+        device = k_cache.device
+        scratch = {
+            "k": torch.zeros(pages, block, *k_cache.shape[2:], dtype=torch.bfloat16, device=device),
+            "v": torch.zeros(pages, block, *v_cache.shape[2:], dtype=torch.bfloat16, device=device),
+            "raw_k": torch.zeros(
+                pages, block, *raw_k.shape[2:], dtype=torch.bfloat16, device=device
+            ),
+            "pos": None,
+        }
+        if getattr(a, "rope_position_cache", None) is not None:
+            scratch["pos"] = torch.zeros(
+                pages, block, 1, 3, dtype=torch.int64, device=device
+            )
+            room = pages * block
+        else:
+            room = pages * block
+        rope = a.rotary_emb
+        irope = a.indexer.rotary_emb
+        section_t, section_h, section_w = _sections(rope)
+        from aiter.ops.qkv_proj_fusion import qkv_proj_fusion as _op
+
+        cos_table = rope.cos_cache.reshape(rope.cos_cache.shape[0], -1)
+        sin_table = rope.sin_cache.reshape(rope.sin_cache.shape[0], -1)
+        done = 0
+        for tokens in sizes:
+            if tokens > room:
+                break
+            hidden = torch.zeros(tokens, 2560, dtype=torch.bfloat16, device=device)
+            positions = torch.arange(tokens, dtype=torch.int64, device=device)
+            rows = positions.unsqueeze(0).expand(3, -1).contiguous()
+            slots = torch.arange(tokens, dtype=torch.int64, device=device)
+            try:
+                _op(
+                    hidden,
+                    a.qkv_proj.weight,
+                    a.indexer.index_qk_proj.weight,
+                    a.q_norm.weight,
+                    a.k_norm.weight,
+                    a.indexer.q_layernorm.weight,
+                    cos_table,
+                    sin_table,
+                    rows,
+                    slots,
+                    scratch["k"],
+                    scratch["v"],
+                    scratch["raw_k"],
+                    pos_cache=scratch["pos"],
+                    rotary_dim=int(rope.rotary_dim),
+                    mrope_section_t=section_t,
+                    mrope_section_h=section_h,
+                    mrope_section_w=section_w,
+                    interleaved=bool(getattr(rope, "mrope_interleaved", False)),
+                    eps=self.eps,
+                    mode="decode",
+                )
+            except Exception as exc:  # noqa: BLE001 - that size then serves native
+                logger.warning(
+                    "QKV projection fusion: warmup skipped size %d (%r)", tokens, exc
+                )
+                continue
+            done += 1
+        logger.info(
+            "QKV projection fusion: warmed %d/%d capture sizes (%s)",
+            done,
+            len(sizes),
+            sizes[:4] + (["..."] if len(sizes) > 4 else []),
+        )
+        return done
 
     # -- call ---------------------------------------------------------------
     def prologue(self, hidden_states, positions, qsa):

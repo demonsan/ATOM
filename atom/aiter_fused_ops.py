@@ -108,13 +108,34 @@ def prewarm_aiter_fused_ops(config, models, rank_name: str = "") -> dict:
         )
     if qkv_fusion_active:
         try:
-            from atom.model_ops.qwen4_exp.qkv_proj_fusion import prewarm
-
-            out["qkv_proj_fusion"] = prewarm([], rank_name)
-        except Exception as exc:  # noqa: BLE001 -- first call compiles instead
+            sizes = list(
+                getattr(
+                    getattr(config, "compilation_config", None),
+                    "cudagraph_capture_sizes",
+                    (),
+                )
+                or ()
+            )
+            sites = []
+            for model in models:
+                for module in model.modules():
+                    site = getattr(module, "qkv_proj_fusion", None)
+                    if site is not None:
+                        sites.append(site)
+            warmed = 0
+            for site in sites:
+                warmed += int(site.warmup(sizes))
+            out["qkv_proj_fusion"] = {"sites": len(sites), "sizes_warmed": warmed}
+            logger.info(
+                "QKV projection fusion [%s]: pre-capture warmup %s",
+                rank_name or "-",
+                out["qkv_proj_fusion"],
+            )
+        except Exception as exc:  # noqa: BLE001 -- capture then keeps native classes
             logger.warning(
-                "QKV projection fusion [%s]: prewarm skipped (%r)",
+                "QKV projection fusion [%s]: pre-capture warmup failed (%r)",
                 rank_name or "-",
                 exc,
             )
+            out["qkv_proj_fusion"] = None
     return out
