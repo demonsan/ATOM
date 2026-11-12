@@ -30,6 +30,17 @@ OP_NAME = "qkv_proj_fusion"
 _DECISIONS: dict[str, int] = {}
 _LOGGED: set[str] = set()
 
+#: Batches the fused provider is golden-qualified on (the Stage1 rows). Any other batch
+#: keeps ATOM's own capture-safe prologue: declining is what routes a call to ATOM
+#: native, while an uncovered batch that reaches aiter falls back to its torch native
+#: path, which performs host work and cannot be CUDA-graph captured.
+_SERVED_TOKENS = frozenset(
+    {
+        1, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 448, 512, 576, 768,
+        1024, 1152, 1344, 1536, 1792,
+    }
+)
+
 
 def _note(reason: str) -> None:
     _DECISIONS[reason] = _DECISIONS.get(reason, 0) + 1
@@ -120,6 +131,8 @@ class QkvProjFusionSite:
             return "no-qsa-metadata"
         if hidden_states.dtype is not __import__("torch").bfloat16:
             return f"hidden-dtype-{hidden_states.dtype}"
+        if int(hidden_states.shape[0]) not in _SERVED_TOKENS:
+            return f"unqualified-batch-{int(hidden_states.shape[0])}"
         if getattr(a, "k_scale_cache", None) is not None:
             return "fp8-kv-native"
         if getattr(a, "k_cache", None) is None or a.k_cache.dtype is not hidden_states.dtype:
