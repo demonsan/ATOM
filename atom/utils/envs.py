@@ -329,6 +329,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of qsa_sparse_paged_gqa. Other steps keep the native kernel. On by
     # default; 0 / false / off disables. Needs aiter with ROCm/aiter#6576.
     "ATOM_QSA_FLYDSL_ATTN": lambda: _flag_env("ATOM_QSA_FLYDSL_ATTN", "1"),
+    # Out-of-tree aiter providers to enable (comma separated, preference order);
+    # equivalent to --aiter-provider-enable. Default empty: nothing is enabled.
+    "ATOM_AITER_PROVIDER_ENABLE": lambda: tuple(
+        name.strip()
+        for name in os.getenv("ATOM_AITER_PROVIDER_ENABLE", "").split(",")
+        if name.strip()
+    ),
     # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
     # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
     # flag, it cannot enable Triton on its own) plus gfx1250 + ATOM_MOE_GU_ITLV=1
