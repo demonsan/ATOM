@@ -135,6 +135,7 @@ class EngineArgs:
     port: int = 8006
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
+    aiter_provider_enable: tuple[str, ...] = ()
     block_size: int = 16
     max_model_len: int | None = None
     max_num_batched_tokens: int = 16384
@@ -337,6 +338,12 @@ class EngineArgs:
             "'fp4' except on gfx942, which defaults to 'fp8'; other models "
             "default to --kv_cache_dtype. 'fp4' is MiniMax-M3's MXFP4 index "
             "cache or another model's own FP4 layout; see the configuration guide.",
+        )
+        parser.add_argument(
+            "--aiter-provider-enable",
+            nargs="+",
+            default=None,
+            help="Out-of-tree aiter providers to enable, in preference order (e.g. qkv-proj-fusion-provider). Default off.",
         )
         parser.add_argument(
             "--block-size", type=int, default=16, help="KV cache block size."
@@ -905,6 +912,12 @@ class EngineArgs:
 
         # Handle special transformations
         kwargs["kv_cache_block_size"] = kwargs.pop("block_size")
+        names = kwargs.get("aiter_provider_enable") or ()
+        if not names:
+            from atom.utils import envs as _envs
+
+            names = _envs.ATOM_AITER_PROVIDER_ENABLE
+        kwargs["aiter_provider_enable"] = tuple(names)
         kwargs["compilation_config"] = CompilationConfig(
             level=kwargs.pop("level"),
             cudagraph_mode=CUDAGraphMode[kwargs.pop("cudagraph_mode")],
