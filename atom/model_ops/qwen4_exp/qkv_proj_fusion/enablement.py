@@ -30,15 +30,14 @@ OP_NAME = "qkv_proj_fusion"
 _DECISIONS: dict[str, int] = {}
 _LOGGED: set[str] = set()
 
-#: Batches the fused provider is golden-qualified on (the Stage1 rows). Any other batch
-#: keeps ATOM's own capture-safe prologue: declining is what routes a call to ATOM
-#: native, while an uncovered batch that reaches aiter falls back to its torch native
-#: path, which performs host work and cannot be CUDA-graph captured.
+#: Batches the fused provider serves: the golden-qualified Stage1 rows at which the fused kernel
+#: is also measurably faster than ATOM's own prologue (0.41-0.90x of it). Any other batch keeps
+#: ATOM's own capture-safe prologue: declining is what routes a call to ATOM native, while an
+#: uncovered batch that reaches aiter falls back to its torch native path, which performs host
+#: work and cannot be CUDA-graph captured. M >= 768 is deliberately absent: there ATOM's large-M
+#: GEMM is as fast or faster (fused 1.00-1.24x of native). Mirrors the provider's QUALIFIED_M.
 _SERVED_TOKENS = frozenset(
-    {
-        1, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 448, 512, 576, 768,
-        1024, 1152, 1344, 1536, 1792,
-    }
+    {1, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 448, 512, 576}
 )
 
 
