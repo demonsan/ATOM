@@ -29,6 +29,7 @@ no fused variant to inherit.
 import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
+from atom import plugin_transition
 from atom.model_ops.deepseek_v41.router import (
     router_logits as fixed_order_router_logits,
 )
@@ -135,6 +136,10 @@ class MoE(V4MoE):
         # fence an internal combine in a backend returning is_complete=True.
         v41_record_tbo_expert_output(routed)
         return routed, is_complete
+
+    def combine_outputs(self, routed, shared, prefix=""):
+        routed, shared = plugin_transition.begin(self.layer_id, routed, shared)
+        return super().combine_outputs(routed, shared, prefix)
 
     def forward(self, hidden):
         return super().forward(hidden.reshape(-1, hidden.shape[-1])).view_as(hidden)
