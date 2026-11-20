@@ -11,6 +11,7 @@ from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom import plugin_host
+from atom.config import get_current_atom_config
 from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.blockscale import native_quant_linear, quantize_fp8
 from atom.model_ops.deepseek_v41.draft_block import DraftStep, draft_step, rotate_rows
@@ -38,6 +39,7 @@ from atom.models.deepseek_v4_dspark import (
 )
 from atom.models.dspark_draft import DSparkDraftModel
 from atom.utils import envs
+from atom.utils.region_graph import ReqGraph
 
 from .attention import Attention
 from .config import build_attention_topology
@@ -292,6 +294,54 @@ class DeepseekV41DSpark(DSparkDraftModel):
             self.mtp[0].main_proj(aux_concat, x_scale=aux_scale)
         )
 
+    def _ctx_input(self, aux_concat, rows, running_tokens):
+        """The context seam's `(x, x_scale)`, recorded on the capture route when
+        a plugin owns `v41.draft.ctx` in this bucket (see `_capture_context_input`)."""
+        if (
+            rows is not None
+            or torch.compiler.is_compiling()
+            or not plugin_host.has_capture_owner(
+                "v41.draft.ctx", running_tokens, explicit=True
+            )
+        ):
+            return self._ctx_seam(aux_concat, rows, running_tokens)
+        return self._capture_context_input(aux_concat, running_tokens)
+
+    def _capture_context_input(self, taps, rows):
+        """Record only tap packing; position-dependent cache writes stay native."""
+        if get_current_atom_config().enforce_eager or rows <= 0:
+            return self._ctx_seam(taps, None, rows)
+        if plugin_host._stream_capturing():
+            with plugin_host.capture_bucket(rows):
+                return self._ctx_seam(taps, None, rows)
+
+        # The runner consumes returned values immediately on its stream. This
+        # local graph has no collectives or cache side effects. Flatten the list
+        # so ReqGraph owns a fresh fixed-address staging tensor for each tap.
+        flat = (taps,) if isinstance(taps, torch.Tensor) else tuple(taps)
+        key = (rows, tuple((t.dtype, t.device, t.shape) for t in flat))
+        graph = getattr(self, "_ctx_graph", None)
+        if graph is None:
+            graph = self._ctx_graph = ReqGraph()
+        if graph.has(key):
+            return graph.replay(flat, key=key)
+
+        def prepare(*inputs):
+            values = inputs[0] if isinstance(taps, torch.Tensor) else list(inputs)
+            return self._ctx_seam(values, None, rows)
+
+        stream = getattr(self, "_ctx_record_stream", None)
+        if stream is None:
+            stream = self._ctx_record_stream = torch.cuda.Stream(device=flat[0].device)
+        main = torch.cuda.current_stream(flat[0].device)
+        stream.wait_stream(main)
+        with torch.cuda.stream(stream), plugin_host.capture_bucket(rows):
+            prepare(*flat)  # Pay JIT and prepare the capture route outside recording.
+            graph.record(prepare, flat, key=key)
+            result = graph.replay(flat, key=key)
+        main.wait_stream(stream)
+        return result
+
     def _main_norm_quant(self):
         """The fused norm built in ``__init__``."""
         return self._main_norm_quant_holder.norm
@@ -335,7 +385,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # target just ran and what these buffers therefore hold. A padding row
         # belongs to a zero-length request in `cu_seqlens_q`, so it is
         # projected and then written nowhere.
-        ctx, ctx_scale = self._ctx_seam(aux_concat, rows, step.running_tokens)
+        ctx, ctx_scale = self._ctx_input(aux_concat, rows, step.running_tokens)
         ctx, ctx_scale = ctx[None], None if ctx_scale is None else ctx_scale[None]
         positions = positions[: step.running_tokens][None]
         layers = self.context_layers

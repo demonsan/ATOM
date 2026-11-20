@@ -52,6 +52,8 @@ import time
 import types
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
@@ -59,6 +61,8 @@ from types import MappingProxyType
 from typing import Any
 
 import torch
+
+from atom.plugin_transition import Phases, register_window
 
 logger = logging.getLogger("atom")
 
@@ -116,6 +120,12 @@ _V41 = "atom/models/deepseek_v41/"
 SEAMS = MappingProxyType(
     dict(
         [
+            _seam(
+                "v41.block.transition", 1, "region", "window",
+                ("routed", "shared"), (), ("q_lora", "kv_pre"), (), "capture_safe",
+                _V41 + "runtime.py", boundary="collective+state",
+                doc="native MoE combine and mHC with paired pre/post callbacks",
+            ),
             _seam(
                 "v41.block.ffn",
                 1,
@@ -264,7 +274,7 @@ SEAMS = MappingProxyType(
                 (),
                 ("aux", "aux_scale"),
                 ("taps", "rows", "running_tokens"),
-                "eager",
+                "capture_safe",
                 _V41 + "dspark.py",
                 doc="DSpark context taps -> main_proj's input pair or (bf16, None)",
             ),
@@ -428,7 +438,10 @@ def register(
             _refuse(seam, owner, "api-mismatch", f"{requires_api} vs {HOOK_API}")
         if graph not in GRAPHS:
             _refuse(seam, owner, "graph-unsupported", f"{graph!r} not in {GRAPHS}")
-        if not callable(impl) or (select is not None and not callable(select)):
+        if spec.form == "window":
+            if select is not None or not isinstance(impl, Phases):
+                _refuse(seam, owner, "window-registration", "use register_window")
+        elif not callable(impl) or (select is not None and not callable(select)):
             _refuse(seam, owner, "not-callable", "impl and select must be callable")
         if _loading is not None and owner != _loading:
             _refuse(seam, owner, "owner-mismatch", f"loading entry point {_loading}")
@@ -1308,18 +1321,40 @@ def reload_plugins(
 # -- dispatch -----------------------------------------------------------------
 
 
+_capture_rows = ContextVar("atom_plugin_capture_rows", default=None)
+
+
+@contextmanager
+def capture_bucket(rows: int):
+    """Explicit rows of a child graph, not the enclosing target forward's rows."""
+    marker = _capture_rows.set(rows)
+    try:
+        yield
+    finally:
+        _capture_rows.reset(marker)
+
+
+def has_capture_owner(seam: str, rows: int, *, explicit=False) -> bool:
+    """Check the installed plan, even in its native arm, to keep A/B topology."""
+    table = _tables.get(rows, {} if explicit else _tables.get("any", {}))
+    return any(route.graph == "capture_safe" for route in table.get(seam, ()))
+
+
 def _graph_state() -> tuple[bool, int | None]:
     """``(captured, bucket)``: inside a CUDA-graph capture, the pass's padded
     rows (``running_tokens``). A target decode graph of batch ``bs`` runs
     ``bs * q_len`` rows (a DSpark verify: ``bs * (1 + k)``); a draft pass,
     recorded by its own graph outside ``in_hipgraph``, ``bs`` times its
     tokens per sequence."""
+    rows = _capture_rows.get()
+    if rows is not None:
+        return True, rows
     from atom.utils.forward_context import get_forward_context
 
     try:
         forward = get_forward_context()
     except Exception:  # noqa: BLE001 -- outside an ATOM forward
-        return False, None
+        return _stream_capturing(), None
     if not (getattr(forward, "in_hipgraph", False) or _stream_capturing()):
         return False, None
     return True, getattr(getattr(forward, "context", None), "running_tokens", None)

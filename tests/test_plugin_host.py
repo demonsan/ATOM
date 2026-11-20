@@ -418,6 +418,7 @@ def test_select_reads_only_what_the_key_holds():
     unkeyed = {
         name: tuple(i for i in spec.inputs if i not in spec.key)
         for name, spec in host.SEAMS.items()
+        if spec.form != "window"  # a window has no per-tensor select callback
     }
     assert unkeyed == {
         FFN: (),
@@ -1237,6 +1238,7 @@ def test_every_seam_is_reached_exactly_once_from_its_target():
             ("site" if s.form == "call" and s.name in _DECORATED else s.form, s.target)
         ]
         for name, s in host.SEAMS.items()
+        if s.form != "window"  # verified as a paired scope by test_together_plugin_ab
     }
     assert found == expected
 
@@ -1257,7 +1259,7 @@ def test_only_the_shared_act_seam_builds_its_own_span():
 def test_seam_specs_are_self_consistent():
     for name, spec in host.SEAMS.items():
         assert spec.name == name and spec.contract >= 1
-        assert spec.kind in ("op", "region") and spec.form in ("bind", "call")
+        assert spec.kind in ("op", "region") and spec.form in ("bind", "call", "window")
         assert spec.graph in ("eager", "capture_safe", "opaque_op")
         assert set(spec.key) <= set(spec.inputs)
         assert spec.parent is None or host.SEAMS[spec.parent].kind == "region"
@@ -1446,7 +1448,7 @@ def test_draft_ctx_and_ffn_call_sites():
         encoding="utf-8"
     )
     assert dspark.count("main_proj(aux_concat, x_scale=aux_scale)") == 2
-    assert "self._ctx_seam(aux_concat, rows, step.running_tokens)" in dspark
+    assert "self._ctx_input(aux_concat, rows, step.running_tokens)" in dspark
     proposer = (REPO_ROOT / "atom/spec_decode/dspark_proposer.py").read_text(
         encoding="utf-8"
     )

@@ -21,7 +21,7 @@ except ImportError:
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from torch import nn
 
-from atom import plugin_host
+from atom import plugin_host, plugin_transition
 from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
     sparse_attn_v41_paged_2src,
 )
@@ -509,8 +509,10 @@ class Attention(nn.Module):
         """``queries``: bounded replay's `QueryRows`, the rows of ``step`` this
         layer is asked outputs for; KV is still every row's."""
         compressed = self._fork_compress(hidden, cache, step, rope)
-        q_lora, kv_pre = self.project_qkv(
-            hidden if hidden_fp8 is None else hidden_fp8, hidden_scale
+        q_lora, kv_pre = plugin_transition.end(
+            self.spec.layer_id, self.project_qkv,
+            hidden if hidden_fp8 is None else hidden_fp8, hidden_scale,
+            self.wqkv_a.output_sizes,
         )
         qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
         self._fork_select(
