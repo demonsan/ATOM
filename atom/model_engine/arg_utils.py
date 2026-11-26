@@ -192,6 +192,7 @@ class EngineArgs:
     dspark_config: dict | None = None
     plugin_recipe: str | None = None
     plugin_arm: str = "plugin"
+    plugin_switchable: bool = False
 
     eplb_enable: bool = False
     eplb_config: dict | None = None
@@ -885,7 +886,17 @@ class EngineArgs:
             help="A plugin recipe (atom.plugin_recipe/2), or a directory holding "
             "one strategy's recipes (one per graph-capture bucket set). "
             "Default: no plugin. Check one with `python -m atom.plugin_recipe`. "
-            "To switch recipes, restart (ATOM_PRELOAD=1 keeps the weights).",
+            "To switch recipes, restart (ATOM_PRELOAD=1 keeps the weights), or "
+            "start with --plugin-switchable and POST /plugin/recipe.",
+        )
+        plugins.add_argument(
+            "--plugin-switchable",
+            action="store_true",
+            default=False,
+            help="Every seam the model builds routes (a little per-call routing on "
+            "seams the recipe leaves native), so POST /plugin/recipe can drain "
+            "the server and switch it to another recipe in place: same model, "
+            "weights and parallel layout. Also ATOM_PLUGIN_SWITCHABLE=1.",
         )
         plugins.add_argument(
             "--plugin-arm",

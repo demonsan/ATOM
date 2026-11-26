@@ -20,6 +20,7 @@ if __name__ == "__main__":
 import asyncio
 import contextlib
 import json
+import re
 import logging
 import os
 import time
@@ -3682,6 +3683,88 @@ async def start_profile():
     except Exception as e:
         logger.exception("Failed to start profiling")
         raise HTTPException(status_code=500, detail=f"Failed to start profiling: {e!s}")
+
+
+# -- plugin recipe switch (a --plugin-switchable server) --------------------------
+
+_plugin_switch_lock = asyncio.Lock()
+_plugin_switch_last: dict[str, Any] | None = None
+_SWITCH_REASON = re.compile(r"(?:SwitchRefused: |refused: )([a-z0-9][a-z0-9-]*)")
+
+
+@_engine_route("/plugin/recipe", methods=["POST"])
+async def switch_plugin_recipe(request: Request):
+    """Serve another plugin recipe without a restart (``--plugin-switchable``).
+
+    Body: ``recipe`` (a recipe file or directory on the server's host) or
+    ``documents`` (the recipes themselves), ``arm`` (default ``plugin``),
+    ``reload`` (re-import the providers' code, plus ``reload_roots``),
+    ``clear_prefix_cache`` (default true), ``drain_timeout_s`` (600),
+    ``timeout_s`` (3600). New requests wait while the server finishes what it
+    has; then every TP rank switches and re-records its graphs, and the held
+    requests run on the new recipe. 400: an invalid recipe; 409: refused (the
+    old recipe still serves; ``reason`` says why); 504: no answer in time."""
+    from atom import plugin_recipe
+
+    global _plugin_switch_last
+    try:
+        body = await request.json()
+    except Exception as error:  # noqa: BLE001 -- answered as a bad request
+        raise HTTPException(400, detail={"reason": "bad-json", "error": str(error)})
+    if not isinstance(body, dict):
+        raise HTTPException(400, detail={"reason": "bad-json", "error": "not an object"})
+    arm = body.get("arm", "plugin")
+    try:
+        source, plan = plugin_recipe.source_of(
+            body.get("recipe"), arm, documents=body.get("documents")
+        )
+    except plugin_recipe.RecipeRefused as error:
+        raise HTTPException(400, detail={"reason": error.reason, "error": str(error)})
+    if _plugin_switch_lock.locked():
+        raise HTTPException(
+            409, detail={"reason": "switch-in-progress", "error": "a switch is running"}
+        )
+    async with _plugin_switch_lock:
+        started = time.time()
+        try:
+            reply = await asyncio.to_thread(
+                engine.switch_plugin_recipe,
+                source,
+                arm=arm,
+                reload=bool(body.get("reload", False)),
+                reload_roots=tuple(body.get("reload_roots") or ()),
+                clear_prefix_cache=bool(body.get("clear_prefix_cache", True)),
+                drain_timeout_s=float(body.get("drain_timeout_s", 600.0)),
+                timeout=float(body.get("timeout_s", 3600.0)),
+            )
+        except TimeoutError as error:
+            raise HTTPException(504, detail={"reason": "timeout", "error": str(error)})
+        except Exception as error:  # noqa: BLE001 -- the refusal is the answer
+            message = str(error)
+            match = _SWITCH_REASON.search(message)
+            logger.warning("plugin recipe switch failed: %s", message)
+            raise HTTPException(
+                409 if match else 500,
+                detail={
+                    "reason": match.group(1) if match else "switch-failed",
+                    "error": message,
+                },
+            )
+    _plugin_switch_last = {
+        "plan_id": plan.plan_id,
+        "strategy": plan.strategy,
+        "arm": arm,
+        "started": started,
+        "seconds": round(time.time() - started, 3),
+        "reply": reply,
+    }
+    return {"status": "switched", **_plugin_switch_last}
+
+
+@_engine_route("/plugin/status", methods=["GET"])
+async def plugin_switch_status():
+    """Whether a recipe switch is running, and the last one that took."""
+    return {"switching": _plugin_switch_lock.locked(), "last": _plugin_switch_last}
 
 
 @_engine_route("/stop_profile", methods=["POST"])

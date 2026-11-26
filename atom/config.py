@@ -2460,6 +2460,9 @@ class Config:
     # native. --plugin-arm: which planned plugins serve.
     plugin_source: Any = None
     plugin_arm: str = "plugin"
+    # --plugin-switchable: the recipe can be switched while serving
+    # (POST /plugin/recipe; atom.plugin_host.stage_switch).
+    plugin_switchable: bool = False
     # only for quark_online_quantization
     online_quant_config: dict | None = None
     hf_overrides: dict[str, Any] | None = None
@@ -3865,7 +3868,15 @@ class Config:
         # A plugin plan puts opaque ops and AITER providers into the graph. An
         # empty plan keys nothing, so the native cache keys stay as they were.
         source = getattr(self, "plugin_source", None)
-        if source is not None and not source.empty:
+        from atom import plugin_host
+
+        if plugin_host.switchable():
+            # Every recipe a switchable boot serves routes its seams at run
+            # time; only its module takeovers (opaque ops) enter the graph.
+            factors.append(
+                ("switchable", plugin_host.compile_factor(), envs.ATOM_PLUGIN_HOST)
+            )
+        elif source is not None and not source.empty:
             factors.append((source.plan_id, envs.ATOM_PLUGIN_HOST))
 
         hash_str = hashlib.md5(

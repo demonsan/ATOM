@@ -6,8 +6,10 @@ recipe (`atom/plugin_recipe.py`). Nothing in a plugin imports ATOM model code,
 pins ATOM file hashes, or patches ATOM source; a new fusion needs no ATOM change.
 
 A recipe is fixed for the process: `--plugin-recipe <file or directory>` at
-start, `--plugin-arm` to pick an arm. To switch recipes, restart;
-`ATOM_PRELOAD=1` keeps the loaded weights on the GPUs across the restart.
+start, `--plugin-arm` to pick an arm. To switch recipes, restart
+(`ATOM_PRELOAD=1` keeps the loaded weights on the GPUs across the restart), or start
+the server `--plugin-switchable` and switch in place (`POST /plugin/recipe`, see
+`docs/plugin_host_v3.md`).
 `python -m atom.plugin_recipe PATH` validates and dumps a recipe on CPU.
 
 ## What builds what

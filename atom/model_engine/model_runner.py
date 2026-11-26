@@ -969,7 +969,10 @@ class ModelRunner:
         # A recipe's plan (--plugin-recipe) before the build: the model's seams
         # bind as it is built, and the plan may name the model class to build.
         plugin_host.configure(
-            config.plugin_source, arm=config.plugin_arm, config=config
+            config.plugin_source,
+            arm=config.plugin_arm,
+            config=config,
+            switchable=getattr(config, "plugin_switchable", False) or None,
         )
         self.model = get_model(config, self.device, self._build_and_load_model)
         # After weight processing, before warmup and capture. Here rather than in
@@ -4250,6 +4253,116 @@ class ModelRunner:
         return False
 
     @torch.inference_mode()
+    def switch_plugin_recipe(
+        self,
+        documents: list[str],
+        plan_id: str,
+        arm: str = "plugin",
+        reload: bool = False,
+        reload_roots: list[str] | tuple[str, ...] = (),
+    ) -> dict:
+        """Serve another recipe in this process (a switchable boot; the engine
+        has drained, every TP rank runs this at once).
+
+        Stages the recipe (``plugin_host.stage_switch``), agrees with the other
+        TP ranks, then commits -- or rolls back everywhere when any rank refused,
+        the graphs untouched. On commit the CUDA graphs are released (a captured
+        bucket fixes its route), the compiled model reset when the taken-over
+        modules changed, the outgoing providers' memory returned, and the graphs
+        recaptured. Raises ``plugin_host.SwitchRefused`` (the old recipe still
+        serving); returns the switch report."""
+        from atom import plugin_recipe
+        from atom.rollout.memory_manager import release_cudagraphs
+
+        started = time.perf_counter()
+        source = plugin_recipe.RecipeSource(tuple(documents), plan_id, False)
+        refusal = None
+        try:
+            plugin_host.stage_switch(
+                source,
+                arm=arm,
+                config=self.config,
+                device=self.device,
+                reload=reload,
+                reload_roots=reload_roots,
+            )
+        except plugin_host.SwitchRefused as error:
+            refusal = error
+        outcomes = self._tp_gather(
+            None if refusal is None else (refusal.reason, refusal.detail)
+        )
+        if any(o is not None for o in outcomes):
+            if refusal is None:
+                plugin_host.rollback_switch()
+            reason, detail = next(o for o in outcomes if o is not None)
+            rank = next(i for i, o in enumerate(outcomes) if o is not None)
+            raise plugin_host.SwitchRefused(reason, f"TP rank {rank}: {detail}")
+        release_cudagraphs(self)
+        report = plugin_host.commit_switch()
+        if report["recompile"]:
+            self._reset_compilation()
+        gc.collect()
+        torch.cuda.empty_cache()
+        recapture_started = time.perf_counter()
+        if not self.enforce_eager:
+            # The capture the engine runs at start, on the switched routes.
+            try:
+                self.capture_cudagraph()
+            except Exception:  # noqa: BLE001 -- serve eagerly rather than die
+                logger.exception(
+                    "%s: CUDA graph capture after the recipe switch failed; "
+                    "serving eagerly",
+                    self.label,
+                )
+                self.enforce_eager = True
+                self.req_graph = None
+        self._graphs_released_for_sleep = False
+        report.update(
+            recapture_seconds=round(time.perf_counter() - recapture_started, 3),
+            graphs=not self.enforce_eager,
+            switch_seconds=round(time.perf_counter() - started, 3),
+            memory_allocated_gib=round(torch.cuda.memory_allocated() / (1 << 30), 3),
+            memory_reserved_gib=round(torch.cuda.memory_reserved() / (1 << 30), 3),
+        )
+        if self.rank == 0:
+            logger.info("plugin recipe switched: %s", report)
+        return report
+
+    def _tp_gather(self, value):
+        """``value`` of every TP rank (CPU group), in rank order."""
+        group = get_tp_group()
+        if group.world_size <= 1 or group.cpu_group is None:
+            return [value]
+        out = [None] * group.world_size
+        torch.distributed.all_gather_object(out, value, group=group.cpu_group)
+        return out
+
+    def _reset_compilation(self) -> None:
+        """Recompile the model on its next forward: a switch changed the
+        taken-over modules, and a compiled graph holds one opaque op per
+        taken-over module. The compile cache is keyed anew
+        (``plugin_host.compile_factor``), so a recipe seen before reuses its
+        artifacts and a new one compiles."""
+        from atom.utils.decorators import TorchCompileWrapperWithCustomDispatcher
+
+        roots = [self.model, getattr(getattr(self, "drafter", None), "model", None)]
+        wrappers = {}
+        for root in roots:
+            if isinstance(root, torch.nn.Module):
+                for module in root.modules():
+                    if isinstance(module, TorchCompileWrapperWithCustomDispatcher):
+                        wrappers[id(module)] = module
+        self.config.compilation_config.cache_dir = ""
+        self.config.compilation_config.local_cache_dir = None
+        torch._dynamo.reset()
+        for wrapper in wrappers.values():
+            wrapper.reset_compilation()
+        logger.info(
+            "%s: %d compiled module(s) reset for the switched recipe's takeovers",
+            self.label,
+            len(wrappers),
+        )
+
     def capture_cudagraph(self):
         # M3 indexer-only CP puts an all-to-all in the captured decode path, and
         # NCCL sets up peer connections on a group's FIRST collective -- doing

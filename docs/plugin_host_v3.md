@@ -6,11 +6,13 @@ the owners and their kernels -- lives in a plugin package (for example
 plugin_poc, for DeepSeek-V4.1 and Kimi-K3). A new fusion changes the plugin
 package and the recipe, not ATOM.
 
-A plan is fixed for the process. **To switch recipes, restart the server**;
-`ATOM_PRELOAD=1` keeps the loaded weights on the GPUs across the restart (the
-weight cache's key includes the recipe's model classes, and the weight-cache
-daemon builds the recipe's model classes itself, so a daemon's weights are never
-mapped into another model class). There is no in-process hot-plug.
+A plan is fixed for the process unless the server is started
+`--plugin-switchable`: then `POST /plugin/recipe` switches it to another recipe
+in place (see [In-place recipe switch](#in-place-recipe-switch)). Otherwise, **to
+switch recipes, restart the server**; `ATOM_PRELOAD=1` keeps the loaded weights on
+the GPUs across the restart (the weight cache's key includes the recipe's model
+classes, and the weight-cache daemon builds the recipe's model classes itself, so
+a daemon's weights are never mapped into another model class).
 
 ## What ATOM provides
 
@@ -73,6 +75,40 @@ model's routing applies) and then `place_experts` (the logical-to-physical map a
 the load record). An owner that takes over a MoE block under EPLB must route
 through `place_experts` and compute on those same expert tensors, or decline; a
 private copy of the expert weights is not migrated.
+
+## In-place recipe switch
+
+For fast iteration on plugins: a server started with `--plugin-switchable`
+(`ATOM_PLUGIN_SWITCHABLE=1`) serves another recipe without a restart.
+
+```bash
+curl -s -X POST localhost:8000/plugin/recipe -H 'Content-Type: application/json' \
+  -d '{"recipe": "/path/to/recipe-or-dir", "arm": "plugin", "reload": false}'
+curl -s localhost:8000/plugin/status
+```
+
+Body: `recipe` (a path on the server's host) or `documents` (the recipes),
+`arm`, `reload` (re-import the providers' code from disk, plus `reload_roots`),
+`clear_prefix_cache` (default true), `drain_timeout_s` (600), `timeout_s` (3600).
+
+| Step | What happens |
+| --- | --- |
+| drain | The engine takes no new request in (they wait in its queue) and finishes what it has; past `drain_timeout_s` the switch is refused and the waiting requests run. |
+| stage | Every TP rank (`plugin_host.stage_switch`): the new recipe's providers loaded (on `reload`, re-imported; the built model's own modules never), module takeovers re-installed, `check_plan` on the built model, the new providers' `prepare(device)`, the shared weights checked unchanged. Any failure restores the serving recipe on that rank. |
+| agree | The TP ranks exchange their outcome; one refusal rolls every rank back (`rollback_switch`) and the old recipe serves on, its graphs untouched. |
+| commit | The CUDA graphs are released (a captured bucket fixes its route), the outgoing providers dropped -- routes, routers, their modules -- and their optional module-level `release(device)` called for what no collection frees (peer mappings, communicators); then the memory is returned. |
+| recompile | Only when the taken-over modules changed (each is one opaque op in a compiled graph): the compiled model is reset; the compile cache of a switchable boot is keyed by its takeovers (`plugin_host.compile_factor`), not by the plan id, so a set seen before reuses its artifacts. |
+| recapture | The graphs are recorded again on the new routes (decode, token and draft graphs); the waiting requests then run on the new recipe, the prefix cache cleared. |
+
+A switch keeps the model, its weights and the parallel layout. It refuses (HTTP
+409, the old recipe serving) a recipe that builds another model class
+(`model-differs`), another boot hook (`boot-hook-differs`: `model.install` runs
+once), another `env` (`env-differs`: applied once at start) or another runtime
+(`runtime.expect`, e.g. the tensor-parallel size); a provider that does not load
+or register, a plan the built model refuses, a `prepare` that raises or a
+provider that changed shared weights roll back. Single-engine (TP) deployments
+only; DP or PP is refused. A switchable boot binds every seam its model builds to
+a router (seams the recipe leaves native pay one table lookup per call).
 
 ## Still in ATOM's shared code
 

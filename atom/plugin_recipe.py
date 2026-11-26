@@ -636,12 +636,30 @@ def from_cli(recipe: str | None, arm: str = "plugin") -> RecipeSource | None:
     recipe before any worker starts; None: no plugin."""
     if not recipe:
         return None
-    documents = _read(recipe)
-    plan = resolve([json.loads(d) for d in documents])
+    source, plan = source_of(recipe, arm)
+    apply_env(plan)
+    return source
+
+
+def source_of(
+    recipe: str | Path | None = None, arm: str = "plugin", *, documents=None
+) -> tuple[RecipeSource, Plan]:
+    """A recipe file / directory, or its documents (dicts or JSON text), as the
+    ``RecipeSource`` a process carries and the ``Plan`` it resolves to; refuses
+    an invalid recipe or an unknown ``arm``. Sets no environment (``from_cli``
+    does, at start; a switch keeps the started one)."""
+    if documents is not None:
+        texts = tuple(
+            _canonical(json.loads(d) if isinstance(d, str) else d) for d in documents
+        )
+    elif recipe:
+        texts = _read(recipe)
+    else:
+        raise RecipeRefused("recipe-schema", "no recipe given")
+    plan = resolve([json.loads(d) for d in texts])
     if arm not in plan.arms:
         raise RecipeRefused("recipe-unknown-arm", f"{arm!r} not in {sorted(plan.arms)}")
-    apply_env(plan)
-    return RecipeSource(documents, plan.plan_id, plan.empty)
+    return RecipeSource(texts, plan.plan_id, plan.empty), plan
 
 
 def apply_env(plan: Plan | None, environ=None) -> dict[str, str]:

@@ -760,6 +760,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "1": ask every owner of a seam and raise when two accept one call (their
     # cells overlap). Off by default; like the switch above it enables nothing.
     "ATOM_PLUGIN_HOST_STRICT": lambda: os.getenv("ATOM_PLUGIN_HOST_STRICT", "0") == "1",
+    # "1" (or --plugin-switchable): every seam the model builds routes, so
+    # POST /plugin/recipe can switch the serving recipe in place (plugin_host.
+    # stage_switch). Enables no plugin by itself.
+    "ATOM_PLUGIN_SWITCHABLE": lambda: os.getenv("ATOM_PLUGIN_SWITCHABLE", "0") == "1",
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest

@@ -318,6 +318,41 @@ class LLMEngine:
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
         return outputs
 
+    def switch_plugin_recipe(
+        self,
+        source,
+        *,
+        arm: str = "plugin",
+        reload: bool = False,
+        reload_roots: tuple[str, ...] | list[str] = (),
+        clear_prefix_cache: bool = True,
+        drain_timeout_s: float = 600.0,
+        timeout: float = 3600.0,
+    ) -> dict[str, Any]:
+        """Serve another plugin recipe without a restart (``--plugin-switchable``).
+
+        ``source`` is an ``atom.plugin_recipe.RecipeSource``. The engine holds
+        new requests, finishes what it has (``drain_timeout_s``), then every TP
+        rank switches and re-records its CUDA graphs; held requests run on the
+        new recipe. Raises with the refusal when it did not switch (the old
+        recipe still serves). Returns the switch report."""
+        from atom.model_engine.engine_utility import PLUGIN_SWITCH_CMD
+
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            PLUGIN_SWITCH_CMD,
+            timeout=timeout,
+            documents=list(source.documents),
+            plan_id=source.plan_id,
+            arm=arm,
+            reload=bool(reload),
+            reload_roots=list(reload_roots),
+            clear_prefix_cache=bool(clear_prefix_cache),
+            drain_timeout_s=float(drain_timeout_s),
+        )
+        reply = responses[0]
+        logger.info("Plugin recipe switched: %s", reply)
+        return reply
+
     def start_profile(self):
         self.core_mgr.broadcast_utility_command_sync("start_profile")
         logger.info("Profiling started")
