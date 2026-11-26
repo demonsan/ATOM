@@ -4323,6 +4323,11 @@ class ModelRunner:
             switch_seconds=round(time.perf_counter() - started, 3),
             memory_allocated_gib=round(torch.cuda.memory_allocated() / (1 << 30), 3),
             memory_reserved_gib=round(torch.cuda.memory_reserved() / (1 << 30), 3),
+            # Device-wide, so memory outside the caching allocator (IPC windows, native
+            # workspaces of the providers) counts too.
+            device_used_gib=round(
+                (lambda free, total: (total - free) / (1 << 30))(*torch.cuda.mem_get_info()), 3
+            ),
         )
         if self.rank == 0:
             logger.info("plugin recipe switched: %s", report)
