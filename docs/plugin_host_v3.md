@@ -100,6 +100,13 @@ Body: `recipe` (a path on the server's host) or `documents` (the recipes),
 | recompile | Only when the taken-over modules changed (each is one opaque op in a compiled graph): the compiled model is reset; the compile cache of a switchable boot is keyed by its takeovers (`plugin_host.compile_factor`), not by the plan id, so a set seen before reuses its artifacts. |
 | recapture | The graphs are recorded again on the new routes (decode, token and draft graphs); the waiting requests then run on the new recipe, the prefix cache cleared. |
 
+**State that outlives a switch.** A reloading switch drops the provider modules and every
+module-level object they hold, so memory the process can never return (uncached device memory, which
+is never passed to `hipFree`) cannot live in a provider module. `plugin_host.persistent(key)` (frozen
+HOOK_API surface) returns a process-lifetime dict kept in the host (`atom.*` is never unloaded): the
+same dict before and after a switch, a reload (the code that reads it may have changed) and a
+rollback. Keep plain data and a schema version in it; the host never reads, copies or clears it.
+
 A switch keeps the model, its weights and the parallel layout. It refuses (HTTP
 409, the old recipe serving) a recipe that builds another model class
 (`model-differs`), another boot hook (`boot-hook-differs`: `model.install` runs

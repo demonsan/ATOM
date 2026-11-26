@@ -300,6 +300,64 @@ def test_reload_imports_the_providers_code_again(tmp_path, monkeypatch):
         del sys.modules[name]
 
 
+def test_persistent_state_outlives_a_reload_and_a_rollback(tmp_path, monkeypatch):
+    """``plugin_host.persistent(key)``: the same dict before a reloading switch (the provider's modules gone,
+    a changed version imported), after a rolled-back one, and after a committed one."""
+    pkg = tmp_path / "toy_persist_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+
+    def write(value):
+        (pkg / "hook.py").write_text(
+            "from atom import plugin_host\n"
+            "STORE = plugin_host.persistent('toy.persist')\n"
+            f"STORE.setdefault('entries', []).append({value})\n"
+            "def register(h):\n"
+            "    h.register(seam='toy.block.mix', contract=1, owner='r',\n"
+            f"               impl=lambda x, **k: x + {value})\n"
+        )
+
+    write(3)
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    class _Point:
+        module = "toy_persist_pkg.hook"
+
+        def load(self):
+            import importlib
+
+            return importlib.import_module("toy_persist_pkg.hook").register
+
+    monkeypatch.setattr(host, "_entry_points", lambda: {"r": _Point()})
+    plan = _plan(seams={"toy.block.mix": ["r"]})
+    host._persistent.pop("toy.persist", None)
+    host.configure(plan, kill_switch=False, switchable=True)
+    site = host.bind("toy.block.mix", lambda x: x, spec=_TOY)
+    store = host.persistent("toy.persist")
+    assert store == {"entries": [3]} and sys.modules["toy_persist_pkg.hook"].STORE is store
+    write(30)
+    host.stage_switch(plan, device="cpu", reload=True, reload_roots=[str(pkg)])
+    host.rollback_switch()  # the staged version is dropped, the persistent dict is not
+    assert host.persistent("toy.persist") is store and store["entries"] == [3, 30]
+    host.stage_switch(plan, device="cpu", reload=True, reload_roots=[str(pkg)])
+    host.commit_switch()
+    assert site(1) == 31
+    assert host.persistent("toy.persist") is store and store["entries"] == [3, 30, 30]
+    assert sys.modules["toy_persist_pkg.hook"].STORE is store
+    for name in [n for n in sys.modules if n.startswith("toy_persist_pkg")]:
+        del sys.modules[name]
+    host._persistent.pop("toy.persist", None)
+
+
+def test_persistent_keys_are_separate_and_must_be_named():
+    a, b = host.persistent("toy.a"), host.persistent("toy.b")
+    assert a is not b and host.persistent("toy.a") is a and a == {}
+    with pytest.raises(ValueError):
+        host.persistent("")
+    host._persistent.pop("toy.a")
+    host._persistent.pop("toy.b")
+
+
 def test_a_switchable_compile_key_follows_the_takeovers_not_the_plan(monkeypatch):
     host.configure(_plan(seams={"toy.block.mix": []}), kill_switch=False, switchable=True)
     assert host.switchable() and host.compile_factor() == ()

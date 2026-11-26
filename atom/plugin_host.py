@@ -959,6 +959,27 @@ def plugin_options(name: str) -> Mapping[str, Any]:
     return MappingProxyType(dict(raw.get(name, {})))
 
 
+_persistent: dict[str, dict[str, Any]] = {}  # key -> the dict a plugin keeps across switches
+
+
+def persistent(key: str) -> dict[str, Any]:
+    """A plugin package's process-lifetime state (frozen HOOK_API surface): the one dict kept under
+    ``key``, created empty on first use.
+
+    A recipe switch with ``reload`` (and the unload of every outgoing provider) drops the provider modules
+    and every module-level object they hold; a rollback restores the old modules. This dict is neither:
+    it lives in the host (``atom.*`` is never unloaded) until the process ends. It is for state that must
+    outlive the code that made it -- memory the process can never return (uncached device memory) or a
+    handle a collective must see again -- as plain data (ints, bytes, strings, tuples, dicts, lists) that
+    a reloaded, possibly changed version of the plugin can read: keep a schema version inside and a key
+    unique to the plugin (``"<package>.<component>"``). The host never reads, copies or clears it.
+    """
+    if not isinstance(key, str) or not key:
+        raise ValueError("plugin_host.persistent: a non-empty string key")
+    with _lock:
+        return _persistent.setdefault(key, {})
+
+
 def owns(seam: str, rows: int | None = None) -> bool:
     """Whether the active arm has an owner of ``seam`` in any table. A native
     region that spans ``seam`` (fused attention spans qk_norm and attend)
