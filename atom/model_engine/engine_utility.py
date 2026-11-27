@@ -43,12 +43,12 @@ WEIGHT_UPDATE_UTILITY_CMDS = frozenset(
         RECEIVE_WEIGHTS_RDMA_CMD,
     }
 )
-# Drain the engine, then switch the serving plugin recipe on every TP rank
-# (a --plugin-switchable server): answered once it ran, not when received.
-PLUGIN_SWITCH_CMD = "switch_plugin_recipe"
 # As vLLM's pause_generation(mode="keep") / resume_generation.
 PAUSE_GENERATION_CMD = "pause_generation"
 RESUME_GENERATION_CMD = "resume_generation"
+# Every TP rank runs plugin_host's in-place recipe switch (a switchable plugin boot); see
+# ``atom.plugin_host.switch_serving_recipe``, which pauses generation around it.
+PLUGIN_SWITCH_CMD = "switch_plugin_recipe"
 
 
 def memory_tags(args) -> tuple[str, ...]:
@@ -216,8 +216,8 @@ class EngineUtilityHandler:
         "release_constraints": "_handle_release_constraints",
         COLLECTIVE_RPC_CMD: "_handle_collective_rpc",
         PAUSE_GENERATION_CMD: "_handle_pause_generation",
-        PLUGIN_SWITCH_CMD: "_handle_switch_plugin_recipe",
         RESUME_GENERATION_CMD: "_handle_resume_generation",
+        PLUGIN_SWITCH_CMD: "_handle_switch_plugin_recipe",
     }
 
     def __init__(
@@ -995,28 +995,9 @@ class EngineUtilityHandler:
     def _handle_release_constraints(self, args: dict):
         self.runner_mgr.call_func("release_constraints", args["request_ids"])
 
-    def _handle_switch_plugin_recipe(self, args: dict) -> dict | None:
-        """Hold new requests and let the engine finish what it has; the switch
-        runs once it is drained (``EngineCore.run_pending_plugin_switch``),
-        which answers. A refusal here answers at once, nothing held."""
-        args = args if isinstance(args, dict) else {}
-        refusal = self.engine.begin_plugin_switch(args)
-        if refusal is None:
-            logger.info(f"{self.label}: plugin recipe switch pending; draining")
-            return None
-        reply = {
-            "cmd": PLUGIN_SWITCH_CMD,
-            "error": f"refused: {refusal}",
-            "refused_before_writing": True,
-        }
-        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
-        return reply
-
-    def run_plugin_switch(self, args: dict, *, drain_seconds: float) -> dict:
-        """The drained engine switches: every TP rank stages the recipe, they
-        agree, and each commits and re-records its graphs (or all roll back).
-        A switch that took clears the prefix cache unless asked not to: KV
-        computed by the old recipe's kernels would serve the new one."""
+    def _handle_switch_plugin_recipe(self, args: dict) -> dict:
+        """Switch the serving plugin recipe on every TP rank (``ModelRunner.switch_plugin_recipe``
+        -> ``plugin_host.switch_runner``); the caller has paused generation."""
         reply = self._utility_on_every_rank(
             PLUGIN_SWITCH_CMD,
             "switch_plugin_recipe",
@@ -1027,21 +1008,9 @@ class EngineUtilityHandler:
             list(args.get("reload_roots") or ()),
             timeout=_remaining_timeout(args, 1800.0),
         )
-        reply["drain_seconds"] = round(drain_seconds, 3)
-        if not reply.get("error") and args.get("clear_prefix_cache", True):
-            self._forget_cached_prefixes()
-            reply["prefix_cache_cleared"] = True
         logger.info(f"{self.label}: plugin recipe switch: {reply}")
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
-
-    def answer(self, request_id: str | None, reply: dict) -> None:
-        """Send ``reply`` to the caller of an earlier command (``request_id``)."""
-        before = self.output_queue.request_id
-        self.output_queue.request_id = request_id
-        try:
-            self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
-        finally:
-            self.output_queue.request_id = before
 
     def _handle_pause_generation(self, args: dict) -> dict:
         """Schedule nothing until ``resume_generation``.

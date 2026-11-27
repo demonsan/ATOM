@@ -337,16 +337,6 @@ class TorchCompileWrapperWithCustomDispatcher:
             compilation_level >= CompilationLevel.DYNAMO_ONCE
         )
 
-    def reset_compilation(self) -> None:
-        """Forget what Dynamo compiled for this module: its next call compiles
-        again through a fresh backend (a switchable plugin boot whose recipe
-        changed the taken-over modules; ``ModelRunner._reset_compilation``)."""
-        torch._dynamo.eval_frame.remove_from_cache(self.original_code_object)
-        self.compiled_codes.clear()
-        self.compiled_callable = torch.compile(
-            self.forward, backend=init_backend(self.vllm_config)
-        )
-
     def __call__(self, *args, **kwargs):
         """Implement the dispatch logic here, beyond the torch.compile level.
         NOTE: this function can have additional arguments beyond the forward

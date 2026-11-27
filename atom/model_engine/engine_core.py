@@ -24,7 +24,6 @@ from atom.model_engine.dynamic_chunking import (
 )
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import (
-    PLUGIN_SWITCH_CMD,
     EngineUtilityHandler,
     ask_what_runners_cannot_take,
 )
@@ -100,16 +99,6 @@ def flush_dp_reuse(scheduler, output_queue) -> None:
         output_queue.put_nowait(("DP_REUSE", reports))
 
 
-def plugin_switch_unavailable(config) -> str | None:
-    """Why this deployment cannot switch its plugin recipe in place, or None."""
-    if not (getattr(config, "plugin_switchable", False) or envs.ATOM_PLUGIN_SWITCHABLE):
-        return "the server was not started with --plugin-switchable"
-    pc = config.parallel_config
-    if pc.data_parallel_size > 1 or getattr(config, "pipeline_parallel_size", 1) > 1:
-        return "a recipe switch runs on one engine (TP only); this server has DP or PP"
-    return None
-
-
 def publish_idle_state_work(scheduler) -> None:
     """Publish the state loads and stores `scheduler` holds while no batch runs."""
     scheduler._publish_state_loads()
@@ -152,12 +141,6 @@ class EngineCore:
         self._rl_weights_inconsistent = False
         # pause_generation .. resume_generation: nothing new is scheduled.
         self._generation_paused = False
-        # POST /plugin/recipe (a --plugin-switchable server): the switch waits
-        # here while the engine finishes what it has; new requests are held
-        # meanwhile (`run_pending_plugin_switch`).
-        self._plugin_switch: dict | None = None
-        self._held_requests: list[Sequence] = []
-        self._plugin_switch_unavailable = plugin_switch_unavailable(config)
         self.input_address = input_address
         self.output_address = output_address
         # Control traffic arrives on its own socket so CoreManager can keep the
@@ -526,53 +509,6 @@ class EngineCore:
         if not self._is_rl_weights_offloaded and self.has_pending_kv_work():
             self._advance_idle_kv_transfer(dispatch_new=False)
 
-    def begin_plugin_switch(self, args: dict) -> str | None:
-        """Hold new requests until the pending switch ran; why not, or None."""
-        if self._plugin_switch_unavailable is not None:
-            return self._plugin_switch_unavailable
-        if self._plugin_switch is not None:
-            return "another recipe switch is pending"
-        if not args.get("documents") or not args.get("plan_id"):
-            return "the command carries no recipe"
-        now = time.monotonic()
-        self._plugin_switch = {
-            "args": args,
-            "request_id": args.get("request_id"),
-            "since": now,
-            "deadline": now + float(args.get("drain_timeout_s", 600.0)),
-        }
-        return None
-
-    def run_pending_plugin_switch(self) -> None:
-        """Once nothing it took in is left, run the pending switch, let the held
-        requests in and answer; past the drain deadline, refuse instead."""
-        pending = self._plugin_switch
-        if pending is None:
-            return
-        now = time.monotonic()
-        if self.scheduler.is_finished() and not self.has_pending_kv_work():
-            reply = self.utility_handler.run_plugin_switch(
-                pending["args"], drain_seconds=now - pending["since"]
-            )
-        elif now < pending["deadline"]:
-            return
-        else:
-            reply = {
-                "cmd": PLUGIN_SWITCH_CMD,
-                "error": (
-                    "refused: drain-timeout: requests still running after "
-                    f"{now - pending['since']:.0f}s"
-                ),
-                "refused_before_writing": True,
-            }
-        self._plugin_switch = None
-        held, self._held_requests = self._held_requests, []
-        if held:
-            self.scheduler.extend(held)
-            self._ingested_seqs += len(held)
-        reply["held_requests"] = len(held)
-        self.utility_handler.answer(pending["request_id"], reply)
-
     def pause_generation(self, deadline: float) -> None:
         """Schedule nothing until ``resume_generation``; what runs stays put."""
         self._generation_paused = True
@@ -635,9 +571,6 @@ class EngineCore:
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
-                # Read through getattr: stand-in engines (tests) lack the slot.
-                if getattr(self, "_plugin_switch", None) is not None:
-                    self.run_pending_plugin_switch()
                 now = time.monotonic()
                 if now >= next_metrics_push:
                     next_metrics_push = now + metrics_interval
@@ -985,10 +918,6 @@ class EngineCore:
                     logger.debug(f"{self.label}: input_queue get exit engine")
                     return True
                 recv_reqs.append(seq)
-        if recv_reqs and self._plugin_switch is not None:
-            # A recipe switch is draining: they run on the switched recipe.
-            self._held_requests.extend(recv_reqs)
-            recv_reqs = []
         if len(recv_reqs) > 0:
             logger.debug(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
             self.scheduler.extend(recv_reqs)

@@ -32,7 +32,7 @@ Rules:
   compiled region with an owner runs as one opaque op (``atom_plugin::span``)
   that decides on every execution.
 - A plan is fixed for the process unless the server booted switchable
-  (``--plugin-switchable``): then ``POST /plugin/recipe`` drains the server and
+  (``ATOM_PLUGIN_SWITCHABLE=1``): then ``POST /plugin/recipe`` pauses generation and
   switches to another recipe in place (``stage_switch``). Otherwise restart
   (``ATOM_PRELOAD=1`` keeps the loaded weights on the GPUs across it).
 - Decisions, not launches, are counted: a CUDA-graph replay runs no Python.
@@ -42,9 +42,11 @@ from __future__ import annotations
 
 import fnmatch
 import functools
+import gc
 import hashlib
 import importlib
 import logging
+import os
 import re
 import sys
 import threading
@@ -324,7 +326,7 @@ _counts: Counter = Counter()
 _refusals: list[Registration] = []
 _last: Decision | None = None
 _aiter_applied: tuple[str, ...] | None = None  # the enable list AITER last got
-# A switchable boot (``--plugin-switchable``): every bound seam routes, so a
+# A switchable boot (``ATOM_PLUGIN_SWITCHABLE=1``): every bound seam routes, so a
 # recipe switched in later (``switch``) reaches every call site of the model.
 _switchable = False
 
@@ -1189,7 +1191,7 @@ def configure(
     kill = not envs.ATOM_PLUGIN_HOST if kill_switch is None else kill_switch
     with _lock:
         _switchable = not kill and (
-            envs.ATOM_PLUGIN_SWITCHABLE if switchable is None else bool(switchable)
+            (os.environ.get("ATOM_PLUGIN_SWITCHABLE", "0") == "1") if switchable is None else bool(switchable)
         )
         _plan = None if kill else plan
         _kill_switch = kill
@@ -1333,9 +1335,9 @@ def prepare_plan(device: Any = None) -> dict[str, Any]:
 
 # -- in-process recipe switch (a switchable boot) -------------------------------
 #
-# A server started with ``--plugin-switchable`` binds every seam to a router, so
-# another recipe can take over while it runs: the engine drains what it is
-# serving, every TP rank stages the new recipe (``stage_switch``: its providers
+# A server started with ``ATOM_PLUGIN_SWITCHABLE=1`` binds every seam to a router, so
+# another recipe can take over while it runs: the engine pauses generation (what
+# runs keeps its KV and waits; see ``switch_serving_recipe``), every TP rank stages the new recipe (``stage_switch``: its providers
 # loaded -- their code re-imported on ``reload`` --, module takeovers
 # re-installed, the plan checked against the built model, the new providers
 # prepared, the shared weights unchanged), the ranks agree, and each commits
@@ -1416,7 +1418,7 @@ def _switch_refusal(plan, arm: str, config: Any) -> tuple[str, str] | None:
     from atom import plugin_recipe
 
     if not _switchable:
-        return "not-switchable", "the server was not started with --plugin-switchable"
+        return "not-switchable", "the server was not started with ATOM_PLUGIN_SWITCHABLE=1"
     if _staged is not None:
         return "switch-in-progress", "another switch is staged"
     if plan is None:
@@ -1682,6 +1684,212 @@ def rollback_switch() -> None:
         )
         _staged = None
     logger.info("plugin_host: switch rolled back to %s", getattr(_plan, "plan_id", None))
+
+
+# -- the switch on a running server ---------------------------------------------
+#
+# Built on what ATOM already has: the engine's pause_generation / resume_generation (what runs
+# keeps its KV and waits; new requests queue), a utility command that every TP rank answers
+# (``engine_utility.PLUGIN_SWITCH_CMD`` -> ``ModelRunner.switch_plugin_recipe`` -> ``switch_runner``),
+# ``atom.rollout.memory_manager.release_cudagraphs`` and the runner's own graph capture. The weights do
+# not change, so the KV pool stays. ``POST /plugin/recipe`` (api_server) only calls
+# ``switch_serving_recipe``.
+
+SWITCH_ENV = "ATOM_PLUGIN_SWITCHABLE"
+_SWITCH_REASON = re.compile(r"(?:SwitchRefused: |refused: )([a-z0-9][a-z0-9-]*)")
+
+
+def switch_unavailable(config) -> tuple[str, str] | None:
+    """(reason, detail) why this deployment cannot switch its recipe in place, or None. Checked by the
+    API server before anything pauses."""
+    if os.environ.get(SWITCH_ENV, "0") != "1":
+        return "not-switchable", f"the server was not started with {SWITCH_ENV}=1"
+    pc = config.parallel_config
+    if pc.data_parallel_size > 1 or getattr(config, "pipeline_parallel_size", 1) > 1:
+        return "dp-or-pp", "a recipe switch runs on one engine (TP only); this server has DP or PP"
+    return None
+
+
+def switch_serving_recipe(
+    engine,
+    source,
+    *,
+    arm: str = "plugin",
+    reload: bool = False,
+    reload_roots: Iterable[str] = (),
+    timeout: float = 3600.0,
+) -> dict[str, Any]:
+    """Serve ``source`` (an ``atom.plugin_recipe.RecipeSource``) without a restart. ``engine`` is the
+    API server's ``LLMEngine``.
+
+    Generation is paused (``mode="keep"``: what is running waits where it is, new requests queue), every
+    TP rank switches and re-records its CUDA graphs, then generation resumes -- also when the switch
+    refused or failed. Raises ``SwitchRefused`` when the old recipe still serves, ``TimeoutError`` past
+    ``timeout``. Returns the engine's reply: ``{"cmd", "result": the rank-0 switch report, "pause_seconds"}``."""
+    from atom.model_engine.engine_utility import (
+        PAUSE_GENERATION_CMD,
+        PLUGIN_SWITCH_CMD,
+        RESUME_GENERATION_CMD,
+    )
+
+    refusal = switch_unavailable(engine.config)
+    if refusal is not None:
+        raise SwitchRefused(*refusal)
+    core = engine.core_mgr
+    started = time.monotonic()
+    core.broadcast_utility_command_sync(PAUSE_GENERATION_CMD, timeout=min(300.0, timeout), mode="keep")
+    paused_after = time.monotonic() - started
+    try:
+        replies = core.broadcast_utility_command_sync(
+            PLUGIN_SWITCH_CMD,
+            timeout=timeout,
+            documents=list(source.documents),
+            plan_id=source.plan_id,
+            arm=arm,
+            reload=bool(reload),
+            reload_roots=list(reload_roots),
+        )
+    except TimeoutError:
+        raise
+    except Exception as error:  # noqa: BLE001 -- the engine's refusal is the answer
+        match = _SWITCH_REASON.search(str(error))
+        if match:
+            raise SwitchRefused(match.group(1), str(error)) from error
+        raise
+    finally:
+        try:
+            core.broadcast_utility_command_sync(RESUME_GENERATION_CMD, timeout=300.0)
+        except Exception:  # noqa: BLE001 -- say so loudly; the server is paused until it resumes
+            logger.critical("plugin_host: generation could not be resumed after a recipe switch", exc_info=True)
+    reply = dict(replies[0])
+    reply["pause_seconds"] = round(paused_after, 3)
+    return reply
+
+
+def _tp_gather(value: Any) -> list[Any]:
+    """``value`` of every TP rank (CPU group), in rank order."""
+    from aiter.dist.parallel_state import get_tp_group
+
+    group = get_tp_group()
+    if group.world_size <= 1 or group.cpu_group is None:
+        return [value]
+    out = [None] * group.world_size
+    torch.distributed.all_gather_object(out, value, group=group.cpu_group)
+    return out
+
+
+def _reset_compilation(runner) -> None:
+    """Recompile the model on its next forward: a switch changed the taken-over modules, and a compiled
+    graph holds one opaque op per taken-over module. The compile cache is bypassed for the new set."""
+    from atom.utils.decorators import TorchCompileWrapperWithCustomDispatcher, init_backend
+
+    wrappers = {}
+    for root in (runner.model, getattr(getattr(runner, "drafter", None), "model", None)):
+        if isinstance(root, torch.nn.Module):
+            for module in root.modules():
+                if isinstance(module, TorchCompileWrapperWithCustomDispatcher):
+                    wrappers[id(module)] = module
+    runner.config.compilation_config.cache_dir = ""
+    runner.config.compilation_config.local_cache_dir = None
+    torch._dynamo.reset()
+    for wrapper in wrappers.values():
+        torch._dynamo.eval_frame.remove_from_cache(wrapper.original_code_object)
+        wrapper.compiled_codes.clear()
+        wrapper.compiled_callable = torch.compile(
+            wrapper.forward, backend=init_backend(wrapper.vllm_config)
+        )
+    logger.info(
+        "plugin_host: %d compiled module(s) reset for the switched recipe's takeovers", len(wrappers)
+    )
+
+
+def switch_runner(
+    runner,
+    documents: list[str],
+    plan_id: str,
+    arm: str = "plugin",
+    reload: bool = False,
+    reload_roots: Iterable[str] = (),
+) -> dict[str, Any]:
+    """The switch on one TP rank (``ModelRunner.switch_plugin_recipe``; every rank runs it at once while
+    the engine is paused).
+
+    Stages the recipe (``stage_switch``), agrees with the other TP ranks, then commits -- or rolls back
+    everywhere when any rank refused, the graphs untouched. On commit the CUDA graphs are released
+    (``release_cudagraphs``: a captured bucket fixes its route), the compiled model is reset when the
+    taken-over modules changed, the outgoing providers' memory is returned, and the graphs are recaptured
+    through the runner's own path. The KV pool is not touched. Raises ``SwitchRefused`` (the old recipe
+    still serving); returns the switch report (plain data: it travels through the engine)."""
+    from atom import plugin_recipe
+    from atom.rollout.memory_manager import release_cudagraphs
+
+    started = time.perf_counter()
+    source = plugin_recipe.RecipeSource(tuple(documents), plan_id, False)
+    refusal = None
+    try:
+        stage_switch(
+            source,
+            arm=arm,
+            config=runner.config,
+            device=runner.device,
+            reload=reload,
+            reload_roots=reload_roots,
+        )
+    except SwitchRefused as error:
+        refusal = error
+    outcomes = _tp_gather(None if refusal is None else (refusal.reason, refusal.detail))
+    if any(o is not None for o in outcomes):
+        if refusal is None:
+            rollback_switch()
+        reason, detail = next(o for o in outcomes if o is not None)
+        rank = next(i for i, o in enumerate(outcomes) if o is not None)
+        raise SwitchRefused(reason, f"TP rank {rank}: {detail}")
+    with torch.inference_mode():
+        release_cudagraphs(runner)
+        report = commit_switch()
+        if report["recompile"]:
+            _reset_compilation(runner)
+        gc.collect()
+        torch.cuda.empty_cache()
+        recapture_started = time.perf_counter()
+        _recapture(runner)
+    free, total = torch.cuda.mem_get_info()
+    report.update(
+        recapture_seconds=round(time.perf_counter() - recapture_started, 3),
+        graphs=not runner.enforce_eager,
+        switch_seconds=round(time.perf_counter() - started, 3),
+        memory_allocated_gib=round(torch.cuda.memory_allocated() / (1 << 30), 3),
+        memory_reserved_gib=round(torch.cuda.memory_reserved() / (1 << 30), 3),
+        # Device-wide: memory outside the caching allocator (IPC windows, native workspaces of the
+        # providers) counts too.
+        device_used_gib=round((total - free) / (1 << 30), 3),
+    )
+    logger.info("plugin_host: plugin recipe switched: %s", report)
+    return report
+
+
+def _recapture(runner) -> None:
+    """Record the graphs again on the switched routes, through the runner's own path: the rollout
+    runner's wake-up recapture where it has one, else the capture the engine runs at start. A capture
+    that fails leaves the runner serving eagerly rather than dead (as the rollout path does)."""
+    if getattr(runner, "enforce_eager", True):
+        return
+    recapture = getattr(runner, "_recapture_cudagraphs_if_needed", None)
+    if callable(recapture):
+        recapture()
+        return
+    if not getattr(runner, "_graphs_released_for_sleep", False):
+        return
+    try:
+        runner.capture_cudagraph()
+    except Exception:  # noqa: BLE001 -- serve eagerly rather than die
+        logger.exception(
+            "%s: CUDA graph capture after the recipe switch failed; serving eagerly",
+            getattr(runner, "label", "runner"),
+        )
+        runner.enforce_eager = True
+        runner.req_graph = None
+    runner._graphs_released_for_sleep = False
 
 
 # -- dispatch -----------------------------------------------------------------

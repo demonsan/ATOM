@@ -6,8 +6,8 @@ the owners and their kernels -- lives in a plugin package (for example
 plugin_poc, for DeepSeek-V4.1 and Kimi-K3). A new fusion changes the plugin
 package and the recipe, not ATOM.
 
-A plan is fixed for the process unless the server is started
-`--plugin-switchable`: then `POST /plugin/recipe` switches it to another recipe
+A plan is fixed for the process unless the server is started with
+`ATOM_PLUGIN_SWITCHABLE=1`: then `POST /plugin/recipe` switches it to another recipe
 in place (see [In-place recipe switch](#in-place-recipe-switch)). Otherwise, **to
 switch recipes, restart the server**; `ATOM_PRELOAD=1` keeps the loaded weights on
 the GPUs across the restart (the weight cache's key includes the recipe's model
@@ -78,8 +78,8 @@ private copy of the expert weights is not migrated.
 
 ## In-place recipe switch
 
-For fast iteration on plugins: a server started with `--plugin-switchable`
-(`ATOM_PLUGIN_SWITCHABLE=1`) serves another recipe without a restart.
+For fast iteration on plugins: a server started with `ATOM_PLUGIN_SWITCHABLE=1`
+serves another recipe without a restart.
 
 ```bash
 curl -s -X POST localhost:8000/plugin/recipe -H 'Content-Type: application/json' \
@@ -89,16 +89,21 @@ curl -s localhost:8000/plugin/status
 
 Body: `recipe` (a path on the server's host) or `documents` (the recipes),
 `arm`, `reload` (re-import the providers' code from disk, plus `reload_roots`),
-`clear_prefix_cache` (default true), `drain_timeout_s` (600), `timeout_s` (3600).
+`timeout_s` (3600).
+
+The switch is built on what ATOM already has, and adds no engine code of its own: the engine's
+`pause_generation(mode="keep")` / `resume_generation`, one utility command every TP rank answers
+(`ModelRunner.switch_plugin_recipe` -> `plugin_host.switch_runner`), `atom.rollout.memory_manager.release_cudagraphs`
+and the runner's own graph capture. The weights do not change, so the KV pool and the prefix cache stay.
 
 | Step | What happens |
 | --- | --- |
-| drain | The engine takes no new request in (they wait in its queue) and finishes what it has; past `drain_timeout_s` the switch is refused and the waiting requests run. |
+| pause | `pause_generation(mode="keep")`: nothing new is scheduled; what runs keeps its KV and waits where it is, new requests queue. Generation resumes after the switch, also when it refused. A request that was running continues on the new recipe. |
 | stage | Every TP rank (`plugin_host.stage_switch`): the new recipe's providers loaded (on `reload`, re-imported; the built model's own modules never), module takeovers re-installed, `check_plan` on the built model, the new providers' `prepare(device)`, the shared weights checked unchanged. Any failure restores the serving recipe on that rank. |
 | agree | The TP ranks exchange their outcome; one refusal rolls every rank back (`rollback_switch`) and the old recipe serves on, its graphs untouched. |
 | commit | The CUDA graphs are released (a captured bucket fixes its route), the outgoing providers dropped -- routes, routers, their modules -- and their optional module-level `release(device)` called for what no collection frees (peer mappings, communicators); then the memory is returned. |
-| recompile | Only when the taken-over modules changed (each is one opaque op in a compiled graph): the compiled model is reset; the compile cache of a switchable boot is keyed by its takeovers (`plugin_host.compile_factor`), not by the plan id, so a set seen before reuses its artifacts. |
-| recapture | The graphs are recorded again on the new routes (decode, token and draft graphs); the waiting requests then run on the new recipe, the prefix cache cleared. |
+| recompile | Only when the taken-over modules changed (each is one opaque op in a compiled graph): the compiled model is reset and compiles again without the compile cache. |
+| recapture | The graphs are recorded again on the new routes (decode, token and draft graphs); generation resumes and the queued requests run on the new recipe. |
 
 **State that outlives a switch.** A reloading switch drops the provider modules and every
 module-level object they hold, so memory the process can never return (uncached device memory, which

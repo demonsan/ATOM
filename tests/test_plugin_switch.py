@@ -10,7 +10,6 @@ recipe source a switch carries.
 """
 
 import sys
-import time
 import types
 
 import pytest
@@ -18,7 +17,6 @@ import torch
 
 from atom import plugin_host as host
 from atom import plugin_recipe as recipes
-from atom.model_engine import engine_core
 
 ARCH = "DeepseekV41ForCausalLM"
 
@@ -378,85 +376,241 @@ def test_source_of_documents_sets_no_environment(monkeypatch):
         recipes.source_of(documents=[doc], arm="nope")
 
 
-# -- the engine drains, then switches ---------------------------------------------
+# -- the switch on a running server: ATOM's own pause / resume, utility command, graph release ------
 
 
-class _Scheduler:
-    def __init__(self):
-        self.running, self.got = 1, []
+class _Core:
+    """``core_mgr``: records the utility commands the switch sends; ``fail`` makes one raise."""
 
-    def is_finished(self):
-        return self.running == 0
+    def __init__(self, fail=None, resume_fails=False):
+        self.calls, self.fail, self.resume_fails = [], fail or {}, resume_fails
 
-    def extend(self, seqs):
-        self.got.extend(seqs)
-
-
-class _Handler:
-    def __init__(self):
-        self.answers, self.ran = [], []
-
-    def run_plugin_switch(self, args, *, drain_seconds):
-        self.ran.append(args["plan_id"])
-        return {"cmd": "switch_plugin_recipe", "result": {"plan_id": args["plan_id"]}}
-
-    def answer(self, request_id, reply):
-        self.answers.append((request_id, reply))
+    def broadcast_utility_command_sync(self, cmd, timeout=300.0, **kwargs):
+        self.calls.append((cmd, kwargs))
+        if cmd == "resume_generation" and self.resume_fails:
+            raise RuntimeError("resume lost")
+        if cmd in self.fail:
+            raise self.fail[cmd]
+        if cmd == "switch_plugin_recipe":
+            return [{"cmd": cmd, "result": {"plan_id": kwargs["plan_id"], "recompile": False}}]
+        return [{"cmd": cmd}]
 
 
-def _engine(unavailable=None):
-    engine = object.__new__(engine_core.EngineCore)
-    engine.label = "test"
-    engine.scheduler = _Scheduler()
-    engine.utility_handler = _Handler()
-    engine._plugin_switch = None
-    engine._held_requests = []
-    engine._ingested_seqs = 0
-    engine._plugin_switch_unavailable = unavailable
-    engine.has_pending_kv_work = lambda: False
-    return engine
-
-
-def test_the_engine_holds_new_requests_until_drained_then_switches():
-    engine = _engine()
-    args = {"documents": ["{}"], "plan_id": "p2", "request_id": "r1"}
-    assert engine.begin_plugin_switch(args) is None
-    assert "pending" in engine.begin_plugin_switch(args)
-    engine._held_requests.append("seq-new")  # what pull_and_process_input_queue does
-    engine.run_pending_plugin_switch()
-    assert engine.utility_handler.ran == []  # still running: nothing switched
-    engine.scheduler.running = 0
-    engine.run_pending_plugin_switch()
-    assert engine.utility_handler.ran == ["p2"] and engine._plugin_switch is None
-    assert engine.scheduler.got == ["seq-new"] and engine._ingested_seqs == 1
-    (rid, reply), = engine.utility_handler.answers
-    assert rid == "r1" and reply["held_requests"] == 1
-
-
-def test_a_drain_past_its_deadline_is_refused_and_lets_requests_in():
-    engine = _engine()
-    args = {"documents": ["{}"], "plan_id": "p2", "request_id": "r1", "drain_timeout_s": 0}
-    engine.begin_plugin_switch(args)
-    engine._held_requests.append("seq-new")
-    time.sleep(0.01)
-    engine.run_pending_plugin_switch()
-    (rid, reply), = engine.utility_handler.answers
-    assert "drain-timeout" in reply["error"] and engine.scheduler.got == ["seq-new"]
-    assert engine.utility_handler.ran == []
-
-
-def test_a_deployment_that_cannot_switch_refuses_before_holding_anything():
-    engine = _engine(unavailable="the server was not started with --plugin-switchable")
-    assert "--plugin-switchable" in engine.begin_plugin_switch(
-        {"documents": ["{}"], "plan_id": "p"}
+def _engine(monkeypatch, core, *, dp=1, pp=1, switchable=True):
+    if switchable:
+        monkeypatch.setenv("ATOM_PLUGIN_SWITCHABLE", "1")
+    else:
+        monkeypatch.delenv("ATOM_PLUGIN_SWITCHABLE", raising=False)
+    config = types.SimpleNamespace(
+        parallel_config=types.SimpleNamespace(data_parallel_size=dp), pipeline_parallel_size=pp
     )
-    assert engine._plugin_switch is None
-    dp = types.SimpleNamespace(
-        plugin_switchable=True,
-        parallel_config=types.SimpleNamespace(data_parallel_size=2),
-        pipeline_parallel_size=1,
+    return types.SimpleNamespace(config=config, core_mgr=core)
+
+
+def _source(**fields):
+    source, _ = recipes.source_of(documents=[{"schema": recipes.RECIPE_SCHEMA, "arch": ARCH, **fields}])
+    return source
+
+
+def test_a_deployment_that_cannot_switch_refuses_before_pausing_anything(monkeypatch):
+    core = _Core()
+    for dp, pp, switchable, reason in ((1, 1, False, "not-switchable"), (2, 1, True, "dp-or-pp"), (1, 2, True, "dp-or-pp")):
+        with pytest.raises(host.SwitchRefused) as refused:
+            host.switch_serving_recipe(_engine(monkeypatch, core, dp=dp, pp=pp, switchable=switchable), _source())
+        assert refused.value.reason == reason
+    assert core.calls == []
+    assert host.switch_unavailable(_engine(monkeypatch, core).config) is None
+
+
+def test_the_engine_pauses_generation_switches_every_rank_then_resumes(monkeypatch):
+    core = _Core()
+    source = _source(seams={"toy.block.mix": []})
+    reply = host.switch_serving_recipe(
+        _engine(monkeypatch, core), source, arm="plugin", reload=True, reload_roots=["/x"], timeout=100.0
     )
-    assert "DP or PP" in engine_core.plugin_switch_unavailable(dp)
+    assert [c[0] for c in core.calls] == ["pause_generation", "switch_plugin_recipe", "resume_generation"]
+    assert core.calls[0][1] == {"mode": "keep"}  # what runs keeps its KV and waits
+    assert core.calls[1][1] == {
+        "documents": list(source.documents),
+        "plan_id": source.plan_id,
+        "arm": "plugin",
+        "reload": True,
+        "reload_roots": ["/x"],
+    }
+    assert reply["result"]["plan_id"] == source.plan_id and reply["pause_seconds"] >= 0.0
+
+
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        (RuntimeError("TP rank 1: SwitchRefused: model-differs: the recipe builds another model"), "model-differs"),
+        (RuntimeError("refused: drain-timeout: still running"), "drain-timeout"),
+    ],
+)
+def test_a_refusal_is_a_switch_refused_and_generation_resumes(monkeypatch, error, expected):
+    core = _Core(fail={"switch_plugin_recipe": error})
+    with pytest.raises(host.SwitchRefused) as refused:
+        host.switch_serving_recipe(_engine(monkeypatch, core), _source())
+    assert refused.value.reason == expected
+    assert [c[0] for c in core.calls][-1] == "resume_generation"
+
+
+def test_a_timeout_or_other_failure_propagates_and_generation_still_resumes(monkeypatch):
+    for error, raises in ((TimeoutError("no answer"), TimeoutError), (RuntimeError("boom"), RuntimeError)):
+        core = _Core(fail={"switch_plugin_recipe": error})
+        with pytest.raises(raises, match=str(error)):
+            host.switch_serving_recipe(_engine(monkeypatch, core), _source())
+        assert [c[0] for c in core.calls][-1] == "resume_generation"
+
+
+def test_a_resume_that_fails_is_logged_loudly_and_does_not_mask_the_switch(monkeypatch, caplog):
+    core = _Core(resume_fails=True)
+    with caplog.at_level("CRITICAL", logger="atom"):
+        reply = host.switch_serving_recipe(_engine(monkeypatch, core), _source())
+    assert reply["result"]["recompile"] is False
+    assert any("could not be resumed" in r.getMessage() for r in caplog.records)
+
+
+class _Out:
+    def __init__(self):
+        self.sent = []
+
+    def put_nowait(self, item):
+        self.sent.append(item)
+
+
+def test_the_engine_utility_command_runs_the_runner_method_on_every_rank():
+    from atom.model_engine import engine_utility
+    from atom.model_engine.engine_utility import PLUGIN_SWITCH_CMD, EngineUtilityHandler
+
+    asked = []
+
+    class _Mgr:
+        proc_num = 4
+
+        def utility_rpc(self, method, payload, timeout):
+            asked.append((method, payload.args, timeout))
+            return [types.SimpleNamespace(ok=True, value={"plan_id": "p"}, tp_rank=r) for r in range(4)]
+
+    handler = object.__new__(EngineUtilityHandler)
+    handler.runner_mgr, handler.output_queue, handler.label = _Mgr(), _Out(), "test"
+    reply = handler._handle_switch_plugin_recipe(
+        {"documents": ["{}"], "plan_id": "p", "arm": "plugin", "reload": 1, "reload_roots": ["/r"], "timeout": 50.0}
+    )
+    assert PLUGIN_SWITCH_CMD == "switch_plugin_recipe"
+    assert EngineUtilityHandler._UTILITY_HANDLERS[PLUGIN_SWITCH_CMD] == "_handle_switch_plugin_recipe"
+    assert asked == [("switch_plugin_recipe", (["{}"], "p", "plugin", True, ["/r"]), 50.0)]
+    assert reply == {"cmd": PLUGIN_SWITCH_CMD, "result": {"plan_id": "p"}}
+    assert handler.output_queue.sent == [("UTILITY_RESPONSE", reply)]
+    assert engine_utility.PAUSE_GENERATION_CMD == "pause_generation"  # ATOM's own, unchanged
+
+
+def test_the_runner_method_is_plugin_hosts_switch(monkeypatch):
+    from atom.model_engine.model_runner import ModelRunner
+
+    seen = []
+    monkeypatch.setattr(host, "switch_runner", lambda runner, *a, **k: seen.append((runner, a, k)) or {"ok": 1})
+    runner = object.__new__(ModelRunner)
+    assert runner.switch_plugin_recipe(["d"], "p", "plugin", False, []) == {"ok": 1}
+    assert seen == [(runner, (["d"], "p", "plugin", False, []), {})]
+
+
+class _Runner:
+    """The runner ``switch_runner`` drives: what it needs of ModelRunner, and what it was asked."""
+
+    def __init__(self, rollout=False, enforce_eager=False, capture_fails=False):
+        self.config, self.device, self.label = types.SimpleNamespace(), "cuda:0", "ModelRunner0/4"
+        self.enforce_eager, self.req_graph, self.log = enforce_eager, object(), []
+        self._graphs_released_for_sleep = False
+        self.capture_fails = capture_fails
+        if rollout:
+            self._recapture_cudagraphs_if_needed = lambda: self.log.append("recapture-rollout")
+
+    def capture_cudagraph(self):
+        self.log.append("capture")
+        if self.capture_fails:
+            raise RuntimeError("capture failed")
+
+
+@pytest.fixture
+def switch_world(monkeypatch):
+    """Everything below ``switch_runner`` that needs a GPU, a TP group or the engine, as a log."""
+    from atom.rollout import memory_manager
+
+    log = []
+    world = types.SimpleNamespace(log=log, outcomes=None, recompile=False, staged_error=None)
+    monkeypatch.setattr(memory_manager, "release_cudagraphs", lambda r: (log.append("release"), setattr(r, "_graphs_released_for_sleep", True)))
+
+    def stage(source, **kw):
+        log.append(("stage", source.plan_id, kw["reload"]))
+        if world.staged_error:
+            raise world.staged_error
+
+    monkeypatch.setattr(host, "stage_switch", stage)
+    monkeypatch.setattr(host, "commit_switch", lambda: (log.append("commit"), {"recompile": world.recompile, "plan_id": "p2"})[1])
+    monkeypatch.setattr(host, "rollback_switch", lambda: log.append("rollback"))
+    monkeypatch.setattr(host, "_tp_gather", lambda v: world.outcomes if world.outcomes is not None else [v])
+    monkeypatch.setattr(host, "_reset_compilation", lambda r: log.append("reset"))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: log.append("empty_cache"))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a: (10 << 30, 40 << 30))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *a: 3 << 30)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *a: 5 << 30)
+    return world
+
+
+def _switch(runner, **kw):
+    return host.switch_runner(runner, ["{}"], "p2", "plugin", kw.get("reload", False), ())
+
+
+def test_a_runner_switches_in_the_order_stage_release_commit_recapture(switch_world):
+    runner = _Runner()
+    report = _switch(runner, reload=True)
+    assert switch_world.log == [("stage", "p2", True), "release", "commit", "empty_cache"]
+    assert runner.log == ["capture"]  # the capture the engine runs at start, no copy of it
+    assert report["plan_id"] == "p2" and report["graphs"] is True
+    assert report["device_used_gib"] == 30.0 and report["memory_reserved_gib"] == 5.0
+    assert report["switch_seconds"] >= report["recapture_seconds"] >= 0.0
+    assert runner._graphs_released_for_sleep is False
+
+
+def test_a_rollout_runner_recaptures_through_its_own_wake_up_path(switch_world):
+    runner = _Runner(rollout=True)
+    _switch(runner)
+    assert runner.log == ["recapture-rollout"]
+
+
+def test_changed_takeovers_reset_the_compiled_model_before_the_recapture(switch_world):
+    switch_world.recompile = True
+    runner = _Runner()
+    _switch(runner)
+    assert switch_world.log.index("commit") < switch_world.log.index("reset") < switch_world.log.index("empty_cache")
+
+
+def test_a_failed_capture_serves_eagerly_and_an_eager_runner_captures_nothing(switch_world):
+    runner = _Runner(capture_fails=True)
+    report = _switch(runner)
+    assert runner.enforce_eager is True and runner.req_graph is None and report["graphs"] is False
+    eager = _Runner(enforce_eager=True)
+    _switch(eager)
+    assert eager.log == []
+
+
+def test_a_rank_that_refused_rolls_the_others_back_and_nothing_is_released(switch_world):
+    switch_world.outcomes = [None, ("model-differs", "another model"), None]
+    runner = _Runner()
+    with pytest.raises(host.SwitchRefused, match="TP rank 1: another model") as refused:
+        _switch(runner)
+    assert refused.value.reason == "model-differs"
+    assert switch_world.log == [("stage", "p2", False), "rollback"]  # this rank staged: it rolls back; graphs untouched
+    assert runner.log == []
+
+
+def test_this_rank_refusing_has_nothing_to_roll_back(switch_world):
+    switch_world.staged_error = host.SwitchRefused("recipe-unknown-arm", "no such arm")
+    switch_world.outcomes = [("recipe-unknown-arm", "no such arm"), None]
+    with pytest.raises(host.SwitchRefused):
+        _switch(_Runner())
+    assert "rollback" not in switch_world.log and "release" not in switch_world.log
 
 
 def test_a_boot_hook_owner_is_never_released_or_reloaded(monkeypatch):
