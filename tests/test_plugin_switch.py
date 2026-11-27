@@ -505,14 +505,18 @@ def test_the_engine_utility_command_runs_the_runner_method_on_every_rank():
     assert engine_utility.PAUSE_GENERATION_CMD == "pause_generation"  # ATOM's own, unchanged
 
 
-def test_the_runner_method_is_plugin_hosts_switch(monkeypatch):
-    from atom.model_engine.model_runner import ModelRunner
+def test_the_runner_method_is_plugin_hosts_switch():
+    """``ModelRunner`` cannot be imported without a GPU build, so its one method is read from the source: it
+    only hands over to ``plugin_host.switch_runner`` (the switch has no engine code of its own)."""
+    import ast
+    from pathlib import Path
 
-    seen = []
-    monkeypatch.setattr(host, "switch_runner", lambda runner, *a, **k: seen.append((runner, a, k)) or {"ok": 1})
-    runner = object.__new__(ModelRunner)
-    assert runner.switch_plugin_recipe(["d"], "p", "plugin", False, []) == {"ok": 1}
-    assert seen == [(runner, (["d"], "p", "plugin", False, []), {})]
+    source = (Path(__file__).resolve().parents[1] / "atom/model_engine/model_runner.py").read_text()
+    runner = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == "ModelRunner")
+    method = next(n for n in runner.body if isinstance(n, ast.FunctionDef) and n.name == "switch_plugin_recipe")
+    body = [n for n in method.body if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))]
+    assert len(body) == 1 and isinstance(body[0], ast.Return)
+    assert ast.unparse(body[0].value) == "plugin_host.switch_runner(self, *args, **kwargs)"
 
 
 class _Runner:
