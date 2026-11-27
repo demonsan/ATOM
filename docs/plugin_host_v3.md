@@ -6,11 +6,13 @@ the owners and their kernels -- lives in a plugin package (for example
 plugin_poc, for DeepSeek-V4.1 and Kimi-K3). A new fusion changes the plugin
 package and the recipe, not ATOM.
 
-A plan is fixed for the process. **To switch recipes, restart the server**;
-`ATOM_PRELOAD=1` keeps the loaded weights on the GPUs across the restart (the
-weight cache's key includes the recipe's model classes, and the weight-cache
-daemon builds the recipe's model classes itself, so a daemon's weights are never
-mapped into another model class). There is no in-process hot-plug.
+A plan is fixed for the process unless the server is started with
+`ATOM_PLUGIN_SWITCHABLE=1`: then `POST /plugin/recipe` switches it to another recipe
+in place (see [In-place recipe switch](#in-place-recipe-switch)). Otherwise, **to
+switch recipes, restart the server**; `ATOM_PRELOAD=1` keeps the loaded weights on
+the GPUs across the restart (the weight cache's key includes the recipe's model
+classes, and the weight-cache daemon builds the recipe's model classes itself, so
+a daemon's weights are never mapped into another model class).
 
 ## What ATOM provides
 
@@ -73,6 +75,52 @@ model's routing applies) and then `place_experts` (the logical-to-physical map a
 the load record). An owner that takes over a MoE block under EPLB must route
 through `place_experts` and compute on those same expert tensors, or decline; a
 private copy of the expert weights is not migrated.
+
+## In-place recipe switch
+
+For fast iteration on plugins: a server started with `ATOM_PLUGIN_SWITCHABLE=1`
+serves another recipe without a restart.
+
+```bash
+curl -s -X POST localhost:8000/plugin/recipe -H 'Content-Type: application/json' \
+  -d '{"recipe": "/path/to/recipe-or-dir", "arm": "plugin", "reload": false}'
+curl -s localhost:8000/plugin/status
+```
+
+Body: `recipe` (a path on the server's host) or `documents` (the recipes),
+`arm`, `reload` (re-import the providers' code from disk, plus `reload_roots`),
+`timeout_s` (3600).
+
+The switch is built on what ATOM already has, and adds no engine code of its own: the engine's
+`pause_generation(mode="keep")` / `resume_generation`, one utility command every TP rank answers
+(`ModelRunner.switch_plugin_recipe` -> `plugin_host.switch_runner`), `atom.rollout.memory_manager.release_cudagraphs`
+and the runner's own graph capture. The weights do not change, so the KV pool and the prefix cache stay.
+
+| Step | What happens |
+| --- | --- |
+| pause | `pause_generation(mode="keep")`: nothing new is scheduled; what runs keeps its KV and waits where it is, new requests queue. Generation resumes after the switch, also when it refused. A request that was running continues on the new recipe. |
+| stage | Every TP rank (`plugin_host.stage_switch`): the new recipe's providers loaded (on `reload`, re-imported; the built model's own modules never), module takeovers re-installed, `check_plan` on the built model, the new providers' `prepare(device)`, the shared weights checked unchanged. Any failure restores the serving recipe on that rank. |
+| agree | The TP ranks exchange their outcome; one refusal rolls every rank back (`rollback_switch`) and the old recipe serves on, its graphs untouched. |
+| commit | The CUDA graphs are released (a captured bucket fixes its route), the outgoing providers dropped -- routes, routers, their modules -- and their optional module-level `release(device)` called for what no collection frees (peer mappings, communicators); then the memory is returned. |
+| recompile | Only when the taken-over modules changed (each is one opaque op in a compiled graph): the compiled model is reset and compiles again without the compile cache. |
+| recapture | The graphs are recorded again on the new routes (decode, token and draft graphs); generation resumes and the queued requests run on the new recipe. |
+
+**State that outlives a switch.** A reloading switch drops the provider modules and every
+module-level object they hold, so memory the process can never return (uncached device memory, which
+is never passed to `hipFree`) cannot live in a provider module. `plugin_host.persistent(key)` (frozen
+HOOK_API surface) returns a process-lifetime dict kept in the host (`atom.*` is never unloaded): the
+same dict before and after a switch, a reload (the code that reads it may have changed) and a
+rollback. Keep plain data and a schema version in it; the host never reads, copies or clears it.
+
+A switch keeps the model, its weights and the parallel layout. It refuses (HTTP
+409, the old recipe serving) a recipe that builds another model class
+(`model-differs`), another boot hook (`boot-hook-differs`: `model.install` runs
+once), another `env` (`env-differs`: applied once at start) or another runtime
+(`runtime.expect`, e.g. the tensor-parallel size); a provider that does not load
+or register, a plan the built model refuses, a `prepare` that raises or a
+provider that changed shared weights roll back. Single-engine (TP) deployments
+only; DP or PP is refused. A switchable boot binds every seam its model builds to
+a router (seams the recipe leaves native pay one table lookup per call).
 
 ## Still in ATOM's shared code
 

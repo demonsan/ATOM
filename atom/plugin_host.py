@@ -31,7 +31,9 @@ Rules:
 - Traced Python (``torch.compiler.is_compiling()``) is native; a seam inside a
   compiled region with an owner runs as one opaque op (``atom_plugin::span``)
   that decides on every execution.
-- A plan is fixed for the process. To switch plans, restart the server
+- A plan is fixed for the process unless the server booted switchable
+  (``ATOM_PLUGIN_SWITCHABLE=1``): then ``POST /plugin/recipe`` pauses generation and
+  switches to another recipe in place (``stage_switch``). Otherwise restart
   (``ATOM_PRELOAD=1`` keeps the loaded weights on the GPUs across it).
 - Decisions, not launches, are counted: a CUDA-graph replay runs no Python.
 """
@@ -40,9 +42,11 @@ from __future__ import annotations
 
 import fnmatch
 import functools
+import gc
 import hashlib
 import importlib
 import logging
+import os
 import re
 import sys
 import threading
@@ -322,6 +326,9 @@ _counts: Counter = Counter()
 _refusals: list[Registration] = []
 _last: Decision | None = None
 _aiter_applied: tuple[str, ...] | None = None  # the enable list AITER last got
+# A switchable boot (``ATOM_PLUGIN_SWITCHABLE=1``): every bound seam routes, so a
+# recipe switched in later (``switch``) reaches every call site of the model.
+_switchable = False
 
 
 def api_satisfies(requires: str, api: int = HOOK_API) -> bool:
@@ -978,6 +985,27 @@ def plugin_options(name: str) -> Mapping[str, Any]:
     return MappingProxyType(dict(raw.get(name, {})))
 
 
+_persistent: dict[str, dict[str, Any]] = {}  # key -> the dict a plugin keeps across switches
+
+
+def persistent(key: str) -> dict[str, Any]:
+    """A plugin package's process-lifetime state (frozen HOOK_API surface): the one dict kept under
+    ``key``, created empty on first use.
+
+    A recipe switch with ``reload`` (and the unload of every outgoing provider) drops the provider modules
+    and every module-level object they hold; a rollback restores the old modules. This dict is neither:
+    it lives in the host (``atom.*`` is never unloaded) until the process ends. It is for state that must
+    outlive the code that made it -- memory the process can never return (uncached device memory) or a
+    handle a collective must see again -- as plain data (ints, bytes, strings, tuples, dicts, lists) that
+    a reloaded, possibly changed version of the plugin can read: keep a schema version inside and a key
+    unique to the plugin (``"<package>.<component>"``). The host never reads, copies or clears it.
+    """
+    if not isinstance(key, str) or not key:
+        raise ValueError("plugin_host.persistent: a non-empty string key")
+    with _lock:
+        return _persistent.setdefault(key, {})
+
+
 def owns(seam: str, rows: int | None = None) -> bool:
     """Whether the active arm has an owner of ``seam`` in any table. A native
     region that spans ``seam`` (fused attention spans qk_norm and attend)
@@ -1028,8 +1056,11 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
-def _prepare_providers(plan: Any, device: Any) -> tuple[list[str], dict[str, Any]]:
-    """Call the optional module-level ``prepare(device)`` of every planned provider.
+def _prepare_providers(
+    plan: Any, device: Any, names: Iterable[str] | None = None
+) -> tuple[list[str], dict[str, Any]]:
+    """Call the optional module-level ``prepare(device)`` of every planned provider
+    (of ``names`` only, when given: a switch prepares what it brought in).
 
     A provider declares it by exporting ``prepare`` next to its ``register``;
     the call is where a plugin loads and warms its versioned native library.
@@ -1041,7 +1072,10 @@ def _prepare_providers(plan: Any, device: Any) -> tuple[list[str], dict[str, Any
     available = _entry_points()
     prepared: list[str] = []
     native: dict[str, Any] = {}
+    only = None if names is None else set(names)
     for name in plan.providers:
+        if only is not None and name not in only:
+            continue
         entry_point = available.get(name)
         if entry_point is None:
             continue  # an AITER-only provider: prepared below
@@ -1075,6 +1109,8 @@ def _prepare_providers(plan: Any, device: Any) -> tuple[list[str], dict[str, Any
     aiter_points = _aiter_entry_points()
     for name in getattr(plan, "aiter", ()):
         if name in prepared or name not in aiter_points:
+            continue
+        if only is not None and name not in only:
             continue
         try:
             provider = aiter_points[name].load()
@@ -1147,18 +1183,22 @@ def configure(
     config: Any = None,
     kill_switch: bool | None = None,
     strict: bool | None = None,
+    switchable: bool | None = None,
 ) -> None:
     """Load and route ``plan`` (a ``plugin_recipe.Plan``, or the
     ``RecipeSource`` a Config carries) before the model is built.
 
     A plan is all or nothing: a plugin that fails to load, or a planned owner
     that did not register, refuses the start. The plan's AITER providers go to
-    ``aiter.plugin.configure`` when AITER has it. A plan is fixed for the
-    process: to change it, restart (``ATOM_PRELOAD=1`` keeps the weights)."""
+    ``aiter.plugin.configure`` when AITER has it. Without ``switchable`` a plan
+    is fixed for the process (restart to change it; ``ATOM_PRELOAD=1`` keeps
+    the weights). A switchable boot (``ATOM_PLUGIN_SWITCHABLE=1``) binds every
+    seam it builds to a router, so ``switch`` can install another recipe while
+    the server runs."""
     from atom import plugin_recipe
     from atom.utils import envs
 
-    global _plan, _kill_switch, _strict, _on_decline, _loading, _owned, _requested
+    global _plan, _kill_switch, _strict, _on_decline, _owned, _requested, _switchable
     if isinstance(plan, plugin_recipe.RecipeSource):
         plan = plan.resolve()  # Config carries the recipes; each process resolves
     requested = None if plan is None else plan.plan_id
@@ -1174,37 +1214,15 @@ def configure(
         plugin_recipe.check_runtime(plan, config)
     kill = not envs.ATOM_PLUGIN_HOST if kill_switch is None else kill_switch
     with _lock:
+        _switchable = not kill and (
+            (os.environ.get("ATOM_PLUGIN_SWITCHABLE", "0") == "1") if switchable is None else bool(switchable)
+        )
         _plan = None if kill else plan
         _kill_switch = kill
-        _strict = (
-            envs.ATOM_PLUGIN_HOST_STRICT or bool(plan and plan.strict_overlap)
-            if strict is None
-            else strict
-        )
+        _strict = _strict_for(plan, strict)
         _on_decline = plan.on_decline if plan is not None else "native"
-        _registered.clear()
-        _tables.clear()
-        _module_registered.clear()
-        _module_tables.clear()
-        _refusals.clear()
         _spans.clear()
-        if _plan is not None:
-            available = _entry_points()
-            for name in _plan.providers:
-                if name not in available:
-                    continue  # an AITER-only provider
-                _loading = name
-                try:
-                    available[name].load()(sys.modules[__name__])
-                except Exception as error:
-                    raise plugin_recipe.RecipeRefused(
-                        "recipe-plugin-drift", f"{name} failed to load: {error}"
-                    ) from error
-                finally:
-                    _loading = None
-            _tables.update(_route_tables(_plan))
-            _module_tables.update(_module_route_tables(_plan))
-        _owned = frozenset(s for table in _tables.values() for s in table)
+        _load_owners(_plan)
         set_arm(arm if _plan is not None else "plugin", sync_aiter=False)
     _check_plugin_pins(_plan)
     _apply_aiter(force=True)
@@ -1221,6 +1239,45 @@ def configure_runner(config: Any) -> None:
         arm=getattr(config, "plugin_arm", "plugin"),
         config=config,
     )
+
+
+def _strict_for(plan, strict: bool | None) -> bool:
+    from atom.utils import envs
+
+    if strict is not None:
+        return strict
+    return envs.ATOM_PLUGIN_HOST_STRICT or bool(plan and plan.strict_overlap)
+
+
+def _load_owners(plan) -> None:
+    """Register ``plan``'s providers from their entry points and build its route
+    tables (under ``_lock``). A provider that fails to load, or a planned owner
+    that did not register, refuses the plan."""
+    from atom import plugin_recipe
+
+    global _loading, _owned
+    _registered.clear()
+    _tables.clear()
+    _module_registered.clear()
+    _module_tables.clear()
+    _refusals.clear()
+    if plan is not None:
+        available = _entry_points()
+        for name in plan.providers:
+            if name not in available:
+                continue  # an AITER-only provider
+            _loading = name
+            try:
+                available[name].load()(sys.modules[__name__])
+            except Exception as error:
+                raise plugin_recipe.RecipeRefused(
+                    "recipe-plugin-drift", f"{name} failed to load: {error}"
+                ) from error
+            finally:
+                _loading = None
+        _tables.update(_route_tables(plan))
+        _module_tables.update(_module_route_tables(plan))
+    _owned = frozenset(s for table in _tables.values() for s in table)
 
 
 def _route_tables(plan) -> dict[Any, dict[str, tuple[_Route, ...]]]:
@@ -1309,6 +1366,565 @@ def prepare_plan(device: Any = None) -> dict[str, Any]:
         prepared, native = _prepare_providers(_plan, device)
     logger.info("plugin_host: boot plan prepared providers: %s", prepared)
     return {"prepared": prepared, "native": native}
+
+
+# -- in-process recipe switch (a switchable boot) -------------------------------
+#
+# A server started with ``ATOM_PLUGIN_SWITCHABLE=1`` binds every seam to a router, so
+# another recipe can take over while it runs: the engine pauses generation (what
+# runs keeps its KV and waits; see ``switch_serving_recipe``), every TP rank stages the new recipe (``stage_switch``: its providers
+# loaded -- their code re-imported on ``reload`` --, module takeovers
+# re-installed, the plan checked against the built model, the new providers
+# prepared, the shared weights unchanged), the ranks agree, and each commits
+# (``commit_switch``: the outgoing providers released and unloaded) or rolls
+# back (``rollback_switch``: the serving recipe, exactly as before). The runner
+# then re-records its CUDA graphs (a captured bucket fixes its route), and
+# recompiles first when the taken-over modules changed (``compile_factor``).
+# The model, its weights and the parallel layout never change: a recipe that
+# needs another model class, boot hook, environment or runtime is refused.
+
+
+class SwitchRefused(RuntimeError):
+    """A recipe switch that did not happen: refused before anything changed, or
+    rolled back to the recipe that served before it. ``reason`` is a short code."""
+
+    def __init__(self, reason: str, detail: str) -> None:
+        super().__init__(f"{reason}: {detail}")
+        self.reason, self.detail = reason, detail
+
+
+@dataclass
+class _Staged:
+    plan: Any
+    saved: dict[str, Any]
+    old_installed: list[Any]
+    outgoing: dict[str, types.ModuleType]  # provider -> its module, to release
+    unloaded: dict[str, types.ModuleType]  # sys.modules entries taken out
+    roots: list[Path]  # where they came from
+    before: frozenset[str]  # sys.modules before the stage
+    device: Any
+    report: dict[str, Any]
+
+
+_staged: _Staged | None = None
+# Host state a staged switch replaces and a rollback restores.
+_SWITCH_STATE = (
+    "_plan",
+    "_requested",
+    "_strict",
+    "_on_decline",
+    "_arm",
+    "_owned",
+    "_active",
+    "_module_active",
+    "_aiter_applied",
+)
+_SWITCH_CONTAINERS = (
+    "_registered",
+    "_tables",
+    "_module_registered",
+    "_module_tables",
+    "_refusals",
+)
+
+
+def switchable() -> bool:
+    """Whether this process booted switchable, so ``stage_switch`` can run."""
+    return _switchable
+
+
+def compile_factor() -> tuple[tuple[str, str], ...]:
+    """What a switchable boot's compiled graphs hold of the plugin plan: the
+    taken-over modules, one opaque op each. Its seams route at run time under
+    every recipe, so the plan id does not key its compile cache."""
+    return tuple(sorted((r.path, r.attr) for r in _installed))
+
+
+def _boot_owners(plan) -> dict[str, tuple[str, ...]]:
+    owners: dict[str, set[str]] = {name: set() for name in boot_only()}
+    for table in (getattr(plan, "tables", None) or {}).values():
+        for name in owners:
+            owners[name].update((table or {}).get(name, ()))
+    return {name: tuple(sorted(o)) for name, o in owners.items()}
+
+
+def _switch_refusal(plan, arm: str, config: Any) -> tuple[str, str] | None:
+    """Why ``plan`` (on ``arm``) cannot replace the serving recipe here, or None."""
+    from atom import plugin_recipe
+
+    if not _switchable:
+        return "not-switchable", "the server was not started with ATOM_PLUGIN_SWITCHABLE=1"
+    if _staged is not None:
+        return "switch-in-progress", "another switch is staged"
+    if plan is None:
+        return "recipe-empty", "a switch needs a recipe (its 'native' arm serves none)"
+    if arm not in plan.arms:
+        return "recipe-unknown-arm", f"{arm!r} not in {sorted(plan.arms)}"
+    current = _plan
+    before = getattr(current, "model_options", plugin_recipe.ModelOptions())
+    if plan.model_options != before:
+        return "model-differs", (
+            f"the recipe builds {plan.model_options}, the server serves {before}: "
+            "another model needs a restart"
+        )
+    if dict(plan.env) != dict(getattr(current, "env", {}) or {}):
+        return "env-differs", "a recipe's env is applied once at start: restart"
+    if _boot_owners(plan) != _boot_owners(current):
+        return "boot-hook-differs", (
+            f"boot-only seams {sorted(boot_only())} run once at start: restart"
+        )
+    if config is not None:
+        try:
+            plugin_recipe.check_runtime(plan, config)
+        except plugin_recipe.RecipeRefused as error:
+            return error.reason, str(error)
+    return None
+
+
+def _provider_roots(name: str) -> tuple[Path, ...]:
+    try:
+        return provider_code_roots(name)
+    except (LookupError, Exception):  # noqa: BLE001 -- nothing to unload
+        return ()
+
+
+def _model_modules() -> set[str]:
+    """Modules the built models' classes live in, with their packages: never
+    unloaded, or the live modules would stop being instances of their slots."""
+    keep = {__name__}
+    for model, _prefix in _install_roots:
+        for module in model.modules():
+            name = type(module).__module__
+            while name:
+                keep.add(name)
+                name = name.rpartition(".")[0]
+    return keep
+
+
+def _unload_under(
+    roots: Iterable[Path], keep: set[str], protect: Iterable[Path] = ()
+) -> dict[str, types.ModuleType]:
+    """Take the modules whose source lies under ``roots`` out of ``sys.modules``
+    (ATOM's own, ``keep`` and those under ``protect`` stay); the next import
+    loads them from disk."""
+    roots = [Path(r).resolve() for r in roots]
+    protect = [Path(r).resolve() for r in protect]
+    if not roots:
+        return {}
+    taken = {}
+    for name, module in list(sys.modules.items()):
+        if name in keep or name == "atom" or name.startswith("atom."):
+            continue
+        path = _module_file(module) if module is not None else None
+        if path is None:
+            continue
+        path = path.resolve()
+        if any(path == r or r in path.parents for r in protect):
+            continue
+        if any(path == r or r in path.parents for r in roots):
+            taken[name] = sys.modules.pop(name)
+    importlib.invalidate_caches()
+    return taken
+
+
+def _snapshot() -> dict[str, Any]:
+    saved = {name: globals()[name] for name in _SWITCH_STATE}
+    for name in _SWITCH_CONTAINERS:
+        value = globals()[name]
+        saved[name] = list(value) if isinstance(value, list) else dict(value)
+    return saved
+
+
+def _restore(saved, old_installed, unloaded, roots, before) -> None:
+    """Back to the recipe of ``saved``: its globals, its module takeovers (the
+    very routers it built) and the module objects its providers were loaded as
+    (what the stage imported anew under ``roots`` goes again)."""
+    _uninstall_modules()
+    _unload_under(roots, set(before))
+    for name in _SWITCH_CONTAINERS:
+        container = globals()[name]
+        container.clear()
+        if isinstance(container, list):
+            container.extend(saved[name])
+        else:
+            container.update(saved[name])
+    for name in _SWITCH_STATE:
+        globals()[name] = saved[name]
+    sys.modules.update(unloaded)
+    for router in old_installed:
+        setattr(router.module, router.attr, router)
+        _installed.append(router)
+    _slot_class.cache_clear()
+    _cache.clear()
+    _apply_aiter(force=True)
+
+
+def stage_switch(
+    plan,
+    *,
+    arm: str = "plugin",
+    config: Any = None,
+    device: Any = None,
+    reload: bool = False,
+    reload_roots: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Put ``plan`` (a ``Plan`` or ``RecipeSource``) in place of the serving
+    recipe, ready to serve but not yet committed: every TP rank stages, the
+    ranks agree, then each runs ``commit_switch`` or ``rollback_switch``.
+
+    ``reload`` re-imports the providers' code from disk (their code roots and
+    ``reload_roots``; the built models' own modules never). Raises
+    ``SwitchRefused`` with the serving recipe restored when anything fails:
+    a refusal (another model, boot hook, env or runtime), a provider that does
+    not load or register, a plan the built model refuses (``check_plan``), a
+    ``prepare`` that raises, or shared weights a provider changed.
+    Returns the switch report (``recompile``: the taken-over modules changed).
+    """
+    from atom import plugin_recipe
+
+    global _staged, _plan, _requested, _strict, _on_decline
+    started = time.perf_counter()
+    with _lock:
+        try:
+            if isinstance(plan, plugin_recipe.RecipeSource):
+                plan = plan.resolve()
+        except plugin_recipe.RecipeRefused as error:
+            raise SwitchRefused(error.reason, str(error)) from error
+        refusal = _switch_refusal(plan, arm, config)
+        if refusal is not None:
+            raise SwitchRefused(*refusal)
+        old = _plan
+        old_names = tuple(getattr(old, "providers", ()))
+        new_names = tuple(plan.providers)
+        # A boot hook's owners serve what they installed at start, unchanged
+        # (the refusal above): never reloaded, released or unloaded.
+        booted = {o for owners in _boot_owners(old).values() for o in owners}
+        protect = [r for name in sorted(booted) for r in _provider_roots(name)]
+        incoming = (set(new_names) if reload else set(new_names) - set(old_names)) - booted
+        leaving = (set(old_names) if reload else set(old_names) - set(new_names)) - booted
+        points = _entry_points()
+        outgoing = {}
+        for name in sorted(leaving):
+            module = (
+                _entry_point_module(points[name]) if name in points else None
+            )
+            if module is not None:
+                outgoing[name] = module
+        roots = [r for name in sorted(leaving) for r in _provider_roots(name)]
+        if reload:
+            roots += [r for name in new_names for r in _provider_roots(name)]
+            roots += [Path(r) for r in reload_roots]
+        saved = _snapshot()
+        before = frozenset(sys.modules)
+        old_factor = compile_factor()
+        old_installed = list(_installed)
+        unloaded: dict[str, types.ModuleType] = {}
+        try:
+            _uninstall_modules()
+            unloaded = _unload_under(roots, _model_modules(), protect)
+            _slot_class.cache_clear()
+            _plan, _requested = plan, plan.plan_id
+            _strict = _strict_for(plan, None)
+            _on_decline = plan.on_decline
+            _load_owners(plan)
+            set_arm(arm, sync_aiter=False)
+            for model, prefix in _install_roots:
+                _install_into(model, prefix)
+            shadowed = check_plan()["shadowed"]
+            _check_plugin_pins(plan)
+            _apply_aiter(force=True)
+            prepared, native = _prepare_providers(plan, device, incoming)
+            changed = weights_changed()
+            if changed:
+                raise SwitchRefused(
+                    "weights-changed",
+                    f"the recipe's providers changed shared weights: {changed[:8]}",
+                )
+        except Exception as error:
+            _restore(saved, old_installed, unloaded, roots, before)
+            if isinstance(error, SwitchRefused):
+                raise
+            reason = getattr(error, "reason", None) or "switch-failed"
+            raise SwitchRefused(reason, f"{type(error).__name__}: {error}") from error
+        _cache.clear()
+        _route_log.clear()
+        _warned_misses.clear()
+        report = {
+            "plan_id": plan.plan_id,
+            "strategy": plan.strategy,
+            "arm": arm,
+            "from_plan_id": getattr(old, "plan_id", None),
+            "providers": list(new_names),
+            "added": sorted(set(new_names) - set(old_names)),
+            "removed": sorted(set(old_names) - set(new_names)),
+            "reloaded": bool(reload),
+            "unloaded_modules": len(unloaded),
+            "prepared": prepared,
+            "native": native,
+            "modules_installed": [r.path for r in _installed],
+            "recompile": compile_factor() != old_factor,
+            "shadowed": [list(s) for s in shadowed],
+            "stage_seconds": round(time.perf_counter() - started, 3),
+        }
+        _staged = _Staged(
+            plan, saved, old_installed, outgoing, unloaded, roots, before, device, report
+        )
+    logger.info("plugin_host: switch staged: %s", report)
+    return report
+
+
+def commit_switch() -> dict[str, Any]:
+    """Keep the staged recipe: release what the outgoing providers hold.
+
+    The host already dropped every reference to them (routes, routers, their
+    modules in ``sys.modules``; the caller released the graphs that captured
+    their buffers), so their memory goes with the next collection. A provider
+    that holds what no collection frees -- a peer mapping, a communicator,
+    memory registered with another rank -- exports ``release(device)``, called
+    here once (every rank commits, so a collective teardown pairs up)."""
+    global _staged
+    with _lock:
+        staged = _staged
+        if staged is None:
+            raise RuntimeError("commit_switch without a staged switch")
+        released, failed = [], {}
+        for name, module in staged.outgoing.items():
+            release = getattr(module, "release", None)
+            if not callable(release):
+                continue
+            try:
+                release(staged.device)
+                released.append(name)
+            except Exception as error:  # noqa: BLE001 -- the switch already holds
+                failed[name] = f"{type(error).__name__}: {error}"
+                logger.warning("plugin_host: %s release failed: %s", name, error)
+        _staged = None
+    report = {**staged.report, "released": released, "release_failed": failed}
+    staged.outgoing.clear()
+    staged.unloaded.clear()
+    logger.info("plugin_host: switched to %s (arm %s)", report["plan_id"], _arm)
+    return report
+
+
+def rollback_switch() -> None:
+    """Drop the staged recipe: the one that served before it serves again, with
+    its own routers, provider modules and arm."""
+    global _staged
+    with _lock:
+        staged = _staged
+        if staged is None:
+            return
+        _restore(
+            staged.saved, staged.old_installed, staged.unloaded, staged.roots, staged.before
+        )
+        _staged = None
+    logger.info("plugin_host: switch rolled back to %s", getattr(_plan, "plan_id", None))
+
+
+# -- the switch on a running server ---------------------------------------------
+#
+# Built on what ATOM already has: the engine's pause_generation / resume_generation (what runs
+# keeps its KV and waits; new requests queue), a utility command that every TP rank answers
+# (``engine_utility.PLUGIN_SWITCH_CMD`` -> ``ModelRunner.switch_plugin_recipe`` -> ``switch_runner``),
+# ``atom.rollout.memory_manager.release_cudagraphs`` and the runner's own graph capture. The weights do
+# not change, so the KV pool stays. ``POST /plugin/recipe`` (api_server) only calls
+# ``switch_serving_recipe``.
+
+SWITCH_ENV = "ATOM_PLUGIN_SWITCHABLE"
+_SWITCH_REASON = re.compile(r"(?:SwitchRefused: |refused: )([a-z0-9][a-z0-9-]*)")
+
+
+def switch_unavailable(config) -> tuple[str, str] | None:
+    """(reason, detail) why this deployment cannot switch its recipe in place, or None. Checked by the
+    API server before anything pauses."""
+    if os.environ.get(SWITCH_ENV, "0") != "1":
+        return "not-switchable", f"the server was not started with {SWITCH_ENV}=1"
+    pc = config.parallel_config
+    if pc.data_parallel_size > 1 or getattr(config, "pipeline_parallel_size", 1) > 1:
+        return "dp-or-pp", "a recipe switch runs on one engine (TP only); this server has DP or PP"
+    return None
+
+
+def switch_serving_recipe(
+    engine,
+    source,
+    *,
+    arm: str = "plugin",
+    reload: bool = False,
+    reload_roots: Iterable[str] = (),
+    timeout: float = 3600.0,
+) -> dict[str, Any]:
+    """Serve ``source`` (an ``atom.plugin_recipe.RecipeSource``) without a restart. ``engine`` is the
+    API server's ``LLMEngine``.
+
+    Generation is paused (``mode="keep"``: what is running waits where it is, new requests queue), every
+    TP rank switches and re-records its CUDA graphs, then generation resumes -- also when the switch
+    refused or failed. Raises ``SwitchRefused`` when the old recipe still serves, ``TimeoutError`` past
+    ``timeout``. Returns the engine's reply: ``{"cmd", "result": the rank-0 switch report, "pause_seconds"}``."""
+    from atom.model_engine.engine_utility import (
+        PAUSE_GENERATION_CMD,
+        PLUGIN_SWITCH_CMD,
+        RESUME_GENERATION_CMD,
+    )
+
+    refusal = switch_unavailable(engine.config)
+    if refusal is not None:
+        raise SwitchRefused(*refusal)
+    core = engine.core_mgr
+    started = time.monotonic()
+    core.broadcast_utility_command_sync(PAUSE_GENERATION_CMD, timeout=min(300.0, timeout), mode="keep")
+    paused_after = time.monotonic() - started
+    try:
+        replies = core.broadcast_utility_command_sync(
+            PLUGIN_SWITCH_CMD,
+            timeout=timeout,
+            documents=list(source.documents),
+            plan_id=source.plan_id,
+            arm=arm,
+            reload=bool(reload),
+            reload_roots=list(reload_roots),
+        )
+    except TimeoutError:
+        raise
+    except Exception as error:  # noqa: BLE001 -- the engine's refusal is the answer
+        match = _SWITCH_REASON.search(str(error))
+        if match:
+            raise SwitchRefused(match.group(1), str(error)) from error
+        raise
+    finally:
+        try:
+            core.broadcast_utility_command_sync(RESUME_GENERATION_CMD, timeout=300.0)
+        except Exception:  # noqa: BLE001 -- say so loudly; the server is paused until it resumes
+            logger.critical("plugin_host: generation could not be resumed after a recipe switch", exc_info=True)
+    reply = dict(replies[0])
+    reply["pause_seconds"] = round(paused_after, 3)
+    return reply
+
+
+def _tp_gather(value: Any) -> list[Any]:
+    """``value`` of every TP rank (CPU group), in rank order."""
+    from aiter.dist.parallel_state import get_tp_group
+
+    group = get_tp_group()
+    if group.world_size <= 1 or group.cpu_group is None:
+        return [value]
+    out = [None] * group.world_size
+    torch.distributed.all_gather_object(out, value, group=group.cpu_group)
+    return out
+
+
+def _reset_compilation(runner) -> None:
+    """Recompile the model on its next forward: a switch changed the taken-over modules, and a compiled
+    graph holds one opaque op per taken-over module. The compile cache is bypassed for the new set."""
+    from atom.utils.decorators import TorchCompileWrapperWithCustomDispatcher, init_backend
+
+    wrappers = {}
+    for root in (runner.model, getattr(getattr(runner, "drafter", None), "model", None)):
+        if isinstance(root, torch.nn.Module):
+            for module in root.modules():
+                if isinstance(module, TorchCompileWrapperWithCustomDispatcher):
+                    wrappers[id(module)] = module
+    runner.config.compilation_config.cache_dir = ""
+    runner.config.compilation_config.local_cache_dir = None
+    torch._dynamo.reset()
+    for wrapper in wrappers.values():
+        torch._dynamo.eval_frame.remove_from_cache(wrapper.original_code_object)
+        wrapper.compiled_codes.clear()
+        wrapper.compiled_callable = torch.compile(
+            wrapper.forward, backend=init_backend(wrapper.vllm_config)
+        )
+    logger.info(
+        "plugin_host: %d compiled module(s) reset for the switched recipe's takeovers", len(wrappers)
+    )
+
+
+def switch_runner(
+    runner,
+    documents: list[str],
+    plan_id: str,
+    arm: str = "plugin",
+    reload: bool = False,
+    reload_roots: Iterable[str] = (),
+) -> dict[str, Any]:
+    """The switch on one TP rank (``ModelRunner.switch_plugin_recipe``; every rank runs it at once while
+    the engine is paused).
+
+    Stages the recipe (``stage_switch``), agrees with the other TP ranks, then commits -- or rolls back
+    everywhere when any rank refused, the graphs untouched. On commit the CUDA graphs are released
+    (``release_cudagraphs``: a captured bucket fixes its route), the compiled model is reset when the
+    taken-over modules changed, the outgoing providers' memory is returned, and the graphs are recaptured
+    through the runner's own path. The KV pool is not touched. Raises ``SwitchRefused`` (the old recipe
+    still serving); returns the switch report (plain data: it travels through the engine)."""
+    from atom import plugin_recipe
+    from atom.rollout.memory_manager import release_cudagraphs
+
+    started = time.perf_counter()
+    source = plugin_recipe.RecipeSource(tuple(documents), plan_id, False)
+    refusal = None
+    try:
+        stage_switch(
+            source,
+            arm=arm,
+            config=runner.config,
+            device=runner.device,
+            reload=reload,
+            reload_roots=reload_roots,
+        )
+    except SwitchRefused as error:
+        refusal = error
+    outcomes = _tp_gather(None if refusal is None else (refusal.reason, refusal.detail))
+    if any(o is not None for o in outcomes):
+        if refusal is None:
+            rollback_switch()
+        reason, detail = next(o for o in outcomes if o is not None)
+        rank = next(i for i, o in enumerate(outcomes) if o is not None)
+        raise SwitchRefused(reason, f"TP rank {rank}: {detail}")
+    with torch.inference_mode():
+        release_cudagraphs(runner)
+        report = commit_switch()
+        if report["recompile"]:
+            _reset_compilation(runner)
+        gc.collect()
+        torch.cuda.empty_cache()
+        recapture_started = time.perf_counter()
+        _recapture(runner)
+    free, total = torch.cuda.mem_get_info()
+    report.update(
+        recapture_seconds=round(time.perf_counter() - recapture_started, 3),
+        graphs=not runner.enforce_eager,
+        switch_seconds=round(time.perf_counter() - started, 3),
+        memory_allocated_gib=round(torch.cuda.memory_allocated() / (1 << 30), 3),
+        memory_reserved_gib=round(torch.cuda.memory_reserved() / (1 << 30), 3),
+        # Device-wide: memory outside the caching allocator (IPC windows, native workspaces of the
+        # providers) counts too.
+        device_used_gib=round((total - free) / (1 << 30), 3),
+    )
+    logger.info("plugin_host: plugin recipe switched: %s", report)
+    return report
+
+
+def _recapture(runner) -> None:
+    """Record the graphs again on the switched routes, through the runner's own path: the rollout
+    runner's wake-up recapture where it has one, else the capture the engine runs at start. A capture
+    that fails leaves the runner serving eagerly rather than dead (as the rollout path does)."""
+    if getattr(runner, "enforce_eager", True):
+        return
+    recapture = getattr(runner, "_recapture_cudagraphs_if_needed", None)
+    if callable(recapture):
+        recapture()
+        return
+    if not getattr(runner, "_graphs_released_for_sleep", False):
+        return
+    try:
+        runner.capture_cudagraph()
+    except Exception:  # noqa: BLE001 -- serve eagerly rather than die
+        logger.exception(
+            "%s: CUDA graph capture after the recipe switch failed; serving eagerly",
+            getattr(runner, "label", "runner"),
+        )
+        runner.enforce_eager = True
+        runner.req_graph = None
+    runner._graphs_released_for_sleep = False
 
 
 # -- dispatch -----------------------------------------------------------------
@@ -1835,6 +2451,9 @@ def _dispatch(seam, native, capability, inputs, kwargs):
         if _comptime is not None:
             _comptime(_record_traced)
         return native(*inputs, **kwargs)
+    if seam not in _owned:
+        # A switchable boot's router of a seam the current recipe leaves native.
+        return native(*inputs, **kwargs)
     if _arm == "native":
         _record(Decision(seam, "native", "arm-native"))
         return native(*inputs, **kwargs)
@@ -1936,7 +2555,8 @@ def bind(
     ``spec`` is the seam's contract, written here at the call site (a model
     hard-codes its own seams); a seam declared before may omit it.
 
-    No planned owner: ``native`` itself, so the call site is today's call.
+    No planned owner: ``native`` itself, so the call site is today's call
+    (a switchable boot binds a ``Router`` anyway: a later recipe may own it).
     Else a ``Router``; an ``opaque_op`` seam given ``layer`` and ``fake`` is
     wrapped in one opaque op so a compiled graph decides per execution.
     ``capability`` is ``{"quant": ..., "flags": {...}}`` or a callable taking
@@ -1950,7 +2570,7 @@ def bind(
     if spec.form != "bind":
         raise KeyError(f"seam {seam!r} is a {spec.form} seam, not a bound one")
     _bound.add(seam)
-    if seam not in _owned:
+    if seam not in _owned and not _switchable:
         return native
     router = Router(seam, native, capability)
     if spec.graph == "opaque_op" and layer is not None and fake is not None:
@@ -1974,7 +2594,7 @@ _call_capability: dict[str, Callable[..., Mapping[str, Any]]] = {
 
 def call(seam: str, native: Callable[..., Any], *inputs: Any, **kwargs: Any) -> Any:
     """``native(*inputs, **kwargs)``, unless a planned owner of ``seam`` serves."""
-    if seam not in _owned:
+    if seam not in _owned and not _switchable:
         return native(*inputs, **kwargs)
     return _dispatch(seam, native, _call_capability.get(seam), inputs, kwargs)
 
@@ -2190,6 +2810,7 @@ def overhead_probe(
 def _reset_for_testing() -> None:
     """Forget the plan, the binds and the record (tests only)."""
     global _plan, _owned, _last, _kill_switch, _strict, _on_decline, _requested
+    global _switchable, _staged
     with _lock:
         _uninstall_modules()
         _install_roots.clear()
@@ -2208,6 +2829,7 @@ def _reset_for_testing() -> None:
         _weight_models.clear()
         _warned_misses.clear()
         _plan, _owned, _last, _requested = None, frozenset(), None, None
+        _switchable, _staged = False, None
         _kill_switch, _strict, _on_decline = False, False, "native"
         set_arm("plugin", sync_aiter=False)
         global _aiter_applied

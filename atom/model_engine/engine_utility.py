@@ -46,6 +46,9 @@ WEIGHT_UPDATE_UTILITY_CMDS = frozenset(
 # As vLLM's pause_generation(mode="keep") / resume_generation.
 PAUSE_GENERATION_CMD = "pause_generation"
 RESUME_GENERATION_CMD = "resume_generation"
+# Every TP rank runs plugin_host's in-place recipe switch (a switchable plugin boot); see
+# ``atom.plugin_host.switch_serving_recipe``, which pauses generation around it.
+PLUGIN_SWITCH_CMD = "switch_plugin_recipe"
 
 
 def memory_tags(args) -> tuple[str, ...]:
@@ -214,6 +217,7 @@ class EngineUtilityHandler:
         COLLECTIVE_RPC_CMD: "_handle_collective_rpc",
         PAUSE_GENERATION_CMD: "_handle_pause_generation",
         RESUME_GENERATION_CMD: "_handle_resume_generation",
+        PLUGIN_SWITCH_CMD: "_handle_switch_plugin_recipe",
     }
 
     def __init__(
@@ -990,6 +994,23 @@ class EngineUtilityHandler:
 
     def _handle_release_constraints(self, args: dict):
         self.runner_mgr.call_func("release_constraints", args["request_ids"])
+
+    def _handle_switch_plugin_recipe(self, args: dict) -> dict:
+        """Switch the serving plugin recipe on every TP rank (``ModelRunner.switch_plugin_recipe``
+        -> ``plugin_host.switch_runner``); the caller has paused generation."""
+        reply = self._utility_on_every_rank(
+            PLUGIN_SWITCH_CMD,
+            "switch_plugin_recipe",
+            list(args["documents"]),
+            args["plan_id"],
+            args.get("arm", "plugin"),
+            bool(args.get("reload", False)),
+            list(args.get("reload_roots") or ()),
+            timeout=_remaining_timeout(args, 1800.0),
+        )
+        logger.info(f"{self.label}: plugin recipe switch: {reply}")
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
 
     def _handle_pause_generation(self, args: dict) -> dict:
         """Schedule nothing until ``resume_generation``.

@@ -3773,6 +3773,76 @@ async def start_profile():
         raise HTTPException(status_code=500, detail=f"Failed to start profiling: {e!s}")
 
 
+# -- plugin recipe switch (a server started with ATOM_PLUGIN_SWITCHABLE=1) -------
+
+_plugin_switch_lock = asyncio.Lock()
+_plugin_switch_last: dict[str, Any] | None = None
+
+
+@_engine_route("/plugin/recipe", methods=["POST"])
+async def switch_plugin_recipe(request: Request):
+    """Serve another plugin recipe without a restart: ``atom.plugin_host.switch_serving_recipe``.
+
+    Body: ``recipe`` (a recipe file or directory on the server's host) or ``documents`` (the recipes),
+    ``arm`` (default ``plugin``), ``reload`` (re-import the providers' code, plus ``reload_roots``),
+    ``timeout_s`` (3600). 400: an invalid recipe; 409: refused (the old recipe still serves;
+    ``reason`` says why); 504: no answer in time."""
+    from atom import plugin_host, plugin_recipe
+
+    global _plugin_switch_last
+    try:
+        body = await request.json()
+    except Exception as error:  # noqa: BLE001 -- answered as a bad request
+        raise HTTPException(400, detail={"reason": "bad-json", "error": str(error)})
+    if not isinstance(body, dict):
+        raise HTTPException(400, detail={"reason": "bad-json", "error": "not an object"})
+    arm = body.get("arm", "plugin")
+    try:
+        source, plan = plugin_recipe.source_of(
+            body.get("recipe"), arm, documents=body.get("documents")
+        )
+    except plugin_recipe.RecipeRefused as error:
+        raise HTTPException(400, detail={"reason": error.reason, "error": str(error)})
+    if _plugin_switch_lock.locked():
+        raise HTTPException(
+            409, detail={"reason": "switch-in-progress", "error": "a switch is running"}
+        )
+    async with _plugin_switch_lock:
+        started = time.time()
+        try:
+            reply = await asyncio.to_thread(
+                plugin_host.switch_serving_recipe,
+                engine,
+                source,
+                arm=arm,
+                reload=bool(body.get("reload", False)),
+                reload_roots=tuple(body.get("reload_roots") or ()),
+                timeout=float(body.get("timeout_s", 3600.0)),
+            )
+        except plugin_host.SwitchRefused as error:
+            raise HTTPException(409, detail={"reason": error.reason, "error": str(error)})
+        except TimeoutError as error:
+            raise HTTPException(504, detail={"reason": "timeout", "error": str(error)})
+        except Exception as error:  # noqa: BLE001 -- reported, the server keeps serving
+            logger.exception("plugin recipe switch failed")
+            raise HTTPException(500, detail={"reason": "switch-failed", "error": str(error)})
+    _plugin_switch_last = {
+        "plan_id": plan.plan_id,
+        "strategy": plan.strategy,
+        "arm": arm,
+        "started": started,
+        "seconds": round(time.time() - started, 3),
+        "reply": reply,
+    }
+    return {"status": "switched", **_plugin_switch_last}
+
+
+@_engine_route("/plugin/status", methods=["GET"])
+async def plugin_switch_status():
+    """Whether a recipe switch is running, and the last one that took."""
+    return {"switching": _plugin_switch_lock.locked(), "last": _plugin_switch_last}
+
+
 @_engine_route("/stop_profile", methods=["POST"])
 async def stop_profile():
     """Stop profiling the engine."""

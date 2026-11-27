@@ -4431,6 +4431,12 @@ class ModelRunner:
             return True
         return False
 
+    def switch_plugin_recipe(self, *args, **kwargs):
+        """Serve another plugin recipe in this process: the target of the engine's
+        ``switch_plugin_recipe`` utility command on every TP rank (a switchable boot).
+        The switch is ``plugin_host``'s; the engine has paused generation."""
+        return plugin_host.switch_runner(self, *args, **kwargs)
+
     @torch.inference_mode()
     def capture_cudagraph(self):
         # M3 indexer-only CP puts an all-to-all in the captured decode path, and
